@@ -728,3 +728,66 @@ The next practical milestones are:
    inside the protected stream.
 6. Map decoded event reports onto Linux `uinput` keyboard, pointer, scroll, and
    vendor-key reports.
+
+## Clean Pairing Bootstrap Constraints
+
+A clean setup must allow an existing MacBook and the Linux peer to coexist with
+the controller Mac. The Linux peer therefore should not clone or export the
+MacBook's paired identity. It needs its own stable peer identity and its own
+paired record on the controller Mac.
+
+The relevant CoreUtils/Rapport object model is visible through Objective-C
+runtime introspection:
+
+- `CUPairingIdentity` contains `identifier`, `publicKey`, `secretKey`, and
+  `altIRK`. It has `setRandomKeyPair`, `signData:error:`, and signature verify
+  methods.
+- `CUPairedPeer` contains `identifier`, `identifierStr`, `acl`, `altIRK`,
+  `info`, `label`, `model`, `name`, and `publicKey`.
+- `RPIdentity` can be initialized with `initWithPairedPeer:type:` and contains
+  `edPKData`, `edSKData`, `deviceIRKData`, `btIRKData`, `btAddress`,
+  `idsDeviceID`, account fields, and signing/verification methods.
+- `CUPairingManager` exposes async read/write methods:
+  `getPairingIdentityWithOptions:completion:`,
+  `getPairedPeersWithOptions:completion:`,
+  `findPairedPeer:options:completion:`,
+  `savePairedPeer:options:completion:`, and
+  `removePairedPeer:options:completion:`.
+- `CUPairingDaemon` exposes the synchronous equivalents used behind the
+  PairingManager XPC service, including `savePairedPeer:options:` and
+  `copyPairedPeersWithOptions:error:`.
+
+A normal unsigned command-line process can load these private frameworks and
+inspect the classes, but `CUPairingManager` read calls return
+`kMissingEntitlementErr`. Redacted keychain metadata queries also return no
+accessible pairing items from the normal process context. This matches Apple
+daemon entitlements:
+
+- `rapportd` has `com.apple.PairingManager.Read`,
+  `com.apple.PairingManager.Write`, `com.apple.CompanionLink`,
+  `com.apple.rapport.Client`, private HomeKit pairing identity entitlements,
+  and keychain access groups such as `com.apple.rapport`,
+  `com.apple.pairing`, and `com.apple.sharing.appleidauthentication`.
+- `sharingd` has the PairingManager read/write entitlements, private
+  continuity/AppleID keychain groups, IDS continuity messaging entitlements,
+  and `com.apple.rapport.RegenerateIdentity`.
+- `UniversalControl` itself has display/HID/CompanionLink entitlements, but it
+  does not appear to be the daemon that owns PairingManager writes.
+
+Current inference: root access alone is not enough for a clean bootstrap,
+because macOS enforces this through code-signing entitlements and keychain
+access groups. The clean product direction is a two-sided pairing flow:
+
+1. Generate a fresh Linux `CUPairingIdentity`-compatible keypair and stable
+   peer metadata for `fistel`.
+2. Install or negotiate a new `CUPairedPeer`/`RPIdentity` record for that Linux
+   peer on `endor`, without reusing the existing MacBook identity.
+3. Keep the resulting Linux private key on Linux and use it for PairVerify.
+4. Leave the MacBook's Universal Control identity untouched, allowing both
+   devices to remain paired with `endor`.
+
+The unresolved reverse-engineering question is how to create that macOS-side
+paired record without Apple-only entitlements. The next clean experiments should
+focus on an Apple-supported pairing request path in Sharing/Rapport, or on a
+developer-controlled local helper strategy that installs only a new Linux peer
+record and does not export existing device identities.

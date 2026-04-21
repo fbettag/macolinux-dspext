@@ -90,6 +90,24 @@ clang -fobjc-arc -framework Foundation tools/opack-tool.m -o /tmp/opack-tool
 /tmp/opack-tool decode e2425f694570726f62654576616c756509
 ```
 
+Inspect Continuity/Rapport classes and pairing metadata without dumping private
+key material:
+
+```sh
+clang -fobjc-arc -framework Foundation -framework Security \
+  tools/continuity-inspect.m \
+  -o /tmp/continuity-inspect
+/tmp/continuity-inspect classes Pairing
+/tmp/continuity-inspect class CUPairingManager
+/tmp/continuity-inspect pairing-summary
+```
+
+Normal unsigned processes currently receive `kMissingEntitlementErr` from the
+PairingManager read APIs. That is expected and is useful: a clean Linux peer
+bootstrap cannot rely on cloning an existing Mac's Universal Control identity.
+It needs a separate pairing path for a new `CUPairedPeer`/`RPIdentity` or an
+entitled macOS helper.
+
 Advertise a synthetic Apple Continuity BLE NearbyAction/NearbyInfo payload from
 a Linux BlueZ host:
 
