@@ -82,6 +82,10 @@ pub fn frame_type_name(frame_type: u8) -> &'static str {
     match frame_type {
         0x00 => "Invalid",
         0x01 => "NoOp",
+        0x03 => "PairSetupStart",
+        0x04 => "PairSetupNext",
+        0x05 => "PairVerifyStart",
+        0x06 => "PairVerifyNext",
         0x07 => "U_OPACK",
         0x08 => "E_OPACK",
         0x09 => "P_OPACK",

@@ -13,10 +13,12 @@ live under `research/` as reverse-engineering scaffolding.
 - `crates/macolinux-uc-core` contains stable protocol primitives:
   - TLV8 encode/decode
   - Rapport frame encode/decode
+  - OPACK encode/decode for Rapport pre-auth and pairing probes
   - Bonjour `rpFl` to Rapport status flag mapping
   - PairVerify constants recovered from CoreUtils
 - `crates/macolinux-ucd` has inspection subcommands plus experimental
-  CompanionLink mDNS, Continuity BLE, and TCP Rapport frame logging probes.
+  CompanionLink mDNS, Continuity BLE, TCP Rapport frame logging, and
+  PairSetup/PairVerify bootstrap probes.
 - `nix/module.nix` exposes a NixOS service module, but the service is still a
   research probe until PairVerify, encrypted OPACK, and `uinput` are
   implemented.
@@ -28,6 +30,7 @@ cargo test
 cargo run -p macolinux-ucd -- --version
 cargo run -p macolinux-ucd -- tlv8 decode '0601010303616263'
 cargo run -p macolinux-ucd -- rapport dump '08000003010203'
+cargo run -p macolinux-ucd -- pairing resolve --addr endor.local:49427 --frame 0x05 --pairing-info-hex '0320...'
 cargo run -p macolinux-ucd -- serve --help
 ```
 

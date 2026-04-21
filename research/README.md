@@ -37,6 +37,8 @@ TT LL LL LL BODY...
 length. Live Universal Control event traffic observed so far uses `TT=0x08`,
 which `Rapport.framework` labels `E_OPACK` (encrypted OPACK). Rizin analysis
 also shows `TT=0x0a` as `PA_Req`, the unencrypted pre-auth request frame.
+Live probes against the local CompanionLink listener also confirmed
+`0x03/0x04` as PairSetup frames and `0x05/0x06` as PairVerify frames.
 
 See [docs/protocol-notes.md](docs/protocol-notes.md) for the current notes.
 
@@ -81,6 +83,19 @@ Decode or encode HomeKit/Continuity TLV8 blobs from PairVerify captures:
 ./tools/tlv8-tool.py decode '0601010303616263'
 ./tools/tlv8-tool.py encode 0x06=01 0x03=616263
 ```
+
+Drive the current Rust PairVerify bootstrap probe:
+
+```sh
+cargo run -p macolinux-ucd -- pairing resolve \
+  --addr endor.local:49427 \
+  --frame 0x05 \
+  --pairing-info-hex "0320<32-byte-x25519-public-key>"
+```
+
+For PairSetup/PairVerify frames, Rapport expects an OPACK dictionary with the
+short key `_pd`; the value is TLV8 bytes. Long keys such as `pairingInfo` are
+not accepted on the wire.
 
 Round-trip OPACK through the private macOS codec:
 

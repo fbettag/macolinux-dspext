@@ -217,6 +217,10 @@ is `4 + body_length`.
 ```text
 0x00 Invalid
 0x01 NoOp
+0x03 PairSetupStart
+0x04 PairSetupNext
+0x05 PairVerifyStart
+0x06 PairVerifyNext
 0x07 U_OPACK
 0x08 E_OPACK
 0x09 P_OPACK
@@ -233,9 +237,21 @@ is `4 + body_length`.
 0x42 FriendIdentityUpdate
 ```
 
+The `0x03..0x06` mapping is confirmed by live probes against the local
+CompanionLink listener: after `PA_Req`/`PA_Rsp`, frames `0x03` and `0x04`
+enter `PairSetupServer`; frames `0x05` and `0x06` enter `PairVerifyServer`;
+`0x02` is logged as an unhandled frame.
+
 `_clientPreAuthStart` constructs an object, logs `Send PreAuthRequest`, and
 sends it through `_sendFrameType:unencryptedObject:` with frame type `0x0a`.
 That confirms `0x0a` is an unencrypted OPACK pre-auth request.
+
+The OPACK data/string length boundary matters for pairing. Apple treats
+`0x70..0x90` as inline data lengths `0..32`; `0x91` carries a one-byte length,
+`0x92` a little-endian `uint16` length, and `0x93` a little-endian `uint32`
+length. The same pattern applies to strings with base `0x40`. Encoding a
+37-byte `_pd` value as `0x90 0x25 ...` shifts the TLV by one byte on macOS; the
+correct marker is `0x91 0x25 ...`.
 
 Live Universal Control pointer traffic used frame type `0x08`, which Rapport
 labels `E_OPACK`. The captured bodies are high entropy and the framework logs
@@ -815,6 +831,23 @@ CompanionLink pairing request path, then complete a PairVerify-style exchange
 against the temporary Bonjour service. Local macOS helper APIs are useful for
 introspection, but they do not avoid the entitlement problem for creating a real
 Universal Control trust record.
+
+Live TCP bootstrap status:
+
+- A raw TCP client can connect to the `_companion-link._tcp` listener, send
+  `PA_Req` (`0x0a`) containing OPACK `{"_i":"1"}`, and receive `PA_Rsp`
+  (`0x0b`) containing `{"_sv":"715.2"}`.
+- A post-preauth `U_OPACK` or `P_OPACK` request for
+  `rppairing-bonjour-resolve` is ignored while the connection is still in
+  `SPairWait`; PairSetup/PairVerify must happen first.
+- PairSetup/PairVerify payloads are OPACK dictionaries using the short key
+  `_pd` for TLV8 data. Top-level OPACK data is rejected as a bad object type,
+  and the long dictionary key `pairingInfo` is treated as missing pairing data.
+- `PairVerifyStart` (`0x05`) with `_pd = 03 20 <32-byte X25519 public key>`
+  reaches CoreUtils `PairVerifyServer` and returns `PairVerifyNext` (`0x06`)
+  with `_pd = 07 01 04 06 01 00`. Adding method `00 01 02` yields the same
+  response. This means TCP framing, OPACK, `_pd`, and the M1 public-key TLV are
+  now correct; the remaining failure is the trust/identity side of PairVerify.
 
 Current inference: root access alone is not enough for a clean bootstrap,
 because macOS enforces this through code-signing entitlements and keychain
