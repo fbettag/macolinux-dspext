@@ -15,8 +15,8 @@ live under `research/` as reverse-engineering scaffolding.
   - Rapport frame encode/decode
   - Bonjour `rpFl` to Rapport status flag mapping
   - PairVerify constants recovered from CoreUtils
-- `crates/macolinux-ucd` has inspection subcommands plus an experimental
-  CompanionLink mDNS advertiser and TCP Rapport frame logger.
+- `crates/macolinux-ucd` has inspection subcommands plus experimental
+  CompanionLink mDNS, Continuity BLE, and TCP Rapport frame logging probes.
 - `nix/module.nix` exposes a NixOS service module, but the service is still a
   research probe until PairVerify, encrypted OPACK, and `uinput` are
   implemented.
@@ -48,6 +48,7 @@ services.macolinux-uc.enable = true;
 services.macolinux-uc.instance = "linux-peer";
 services.macolinux-uc.ipv4 = "192.0.2.11";
 services.macolinux-uc.bleAddress = "02:00:00:00:00:31";
+services.macolinux-uc.ble.enable = true;
 ```
 
 Do not deploy the service to a production host yet; `serve` is currently a

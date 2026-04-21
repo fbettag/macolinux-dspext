@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use macolinux_uc_core::rapport::frame_type_name;
 
+use crate::ble::BleConfig;
 use crate::mdns::MdnsAdvert;
 
 const SERVICE_TYPE: &str = "_companion-link._tcp.local";
@@ -20,6 +21,7 @@ struct ServeConfig {
     multicast_ipv4: Option<Ipv4Addr>,
     ble_address: Option<String>,
     txt_overrides: Vec<String>,
+    ble: BleConfig,
 }
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -40,6 +42,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         config.instance, config.hostname, ipv4, config.port
     );
     println!("TXT {}", txt.join(" "));
+
+    if config.ble.enabled {
+        config.ble.clone().start();
+    }
 
     let listener_config = config.clone();
     thread::spawn(move || {
@@ -70,6 +76,18 @@ impl ServeConfig {
             multicast_ipv4: None,
             ble_address: None,
             txt_overrides: Vec::new(),
+            ble: BleConfig {
+                enabled: false,
+                btmgmt_path: "btmgmt".into(),
+                index: "0".into(),
+                instance: 1,
+                duration: 0,
+                flags: Some("06".into()),
+                length_flags: 0,
+                nearby_info: Some("0000".into()),
+                nearby_action: Some("0102030405".into()),
+                tlvs: Vec::new(),
+            },
         };
 
         let mut iter = args.iter();
@@ -84,6 +102,25 @@ impl ServeConfig {
                 }
                 "--ble-address" => config.ble_address = Some(next_value(&mut iter, arg)?),
                 "--txt" => config.txt_overrides.push(next_value(&mut iter, arg)?),
+                "--ble-enable" => config.ble.enabled = true,
+                "--btmgmt-path" => config.ble.btmgmt_path = next_value(&mut iter, arg)?,
+                "--ble-index" => config.ble.index = next_value(&mut iter, arg)?,
+                "--ble-instance" => {
+                    config.ble.instance = parse_u8_decimal(&next_value(&mut iter, arg)?)?
+                }
+                "--ble-duration" => config.ble.duration = parse_u32(&next_value(&mut iter, arg)?)?,
+                "--ble-flags" => {
+                    let value = next_value(&mut iter, arg)?;
+                    config.ble.flags = if value.is_empty() { None } else { Some(value) };
+                }
+                "--ble-length-flags" => {
+                    config.ble.length_flags = parse_u8_auto(&next_value(&mut iter, arg)?)?
+                }
+                "--ble-nearby-info" => config.ble.nearby_info = Some(next_value(&mut iter, arg)?),
+                "--ble-nearby-action" => {
+                    config.ble.nearby_action = Some(next_value(&mut iter, arg)?)
+                }
+                "--ble-tlv" => config.ble.tlvs.push(next_value(&mut iter, arg)?),
                 other => return Err(ServeError(format!("unknown serve option: {other}"))),
             }
         }
@@ -106,7 +143,7 @@ impl ServeConfig {
             "rpFl=0x20000".to_string(),
             format!("rpHA={compact_mac}"),
             "rpVr=715.2".to_string(),
-            "rpAD=010203040506".to_string(),
+            "rpAD=0102030405".to_string(),
             "rpHI=0000".to_string(),
             format!("rpBA={mac}"),
         ];
@@ -220,6 +257,28 @@ fn parse_port(value: &str) -> Result<u16, ServeError> {
         .map_err(|err| ServeError(format!("invalid TCP port {value:?}: {err}")))
 }
 
+fn parse_u32(value: &str) -> Result<u32, ServeError> {
+    value
+        .parse()
+        .map_err(|err| ServeError(format!("invalid u32 {value:?}: {err}")))
+}
+
+fn parse_u8_decimal(value: &str) -> Result<u8, ServeError> {
+    value
+        .parse()
+        .map_err(|err| ServeError(format!("invalid u8 {value:?}: {err}")))
+}
+
+fn parse_u8_auto(value: &str) -> Result<u8, ServeError> {
+    let text = value.trim();
+    if let Some(hex) = text.strip_prefix("0x") {
+        u8::from_str_radix(hex, 16)
+    } else {
+        text.parse()
+    }
+    .map_err(|err| ServeError(format!("invalid u8 {value:?}: {err}")))
+}
+
 fn next_value<'a>(
     iter: &mut impl Iterator<Item = &'a String>,
     flag: &str,
@@ -242,7 +301,7 @@ fn hex_prefix(data: &[u8], limit: usize) -> String {
 }
 
 fn usage() -> &'static str {
-    "usage: macolinux-ucd serve [--instance NAME] [--hostname NAME.local] [--port PORT] [--ipv4 ADDR] [--multicast-ipv4 ADDR] [--ble-address MAC] [--txt KEY=VALUE]"
+    "usage: macolinux-ucd serve [--instance NAME] [--hostname NAME.local] [--port PORT] [--ipv4 ADDR] [--multicast-ipv4 ADDR] [--ble-address MAC] [--txt KEY=VALUE] [--ble-enable] [--btmgmt-path PATH] [--ble-index N] [--ble-instance N] [--ble-duration SECONDS] [--ble-nearby-action HEX] [--ble-nearby-info HEX] [--ble-tlv TYPE:HEX]"
 }
 
 #[derive(Debug, Clone)]
@@ -287,5 +346,33 @@ mod tests {
         let mac = synthetic_mac_bytes("linux-peer");
         assert_eq!(mac[0] & 0x02, 0x02);
         assert_eq!(mac[0] & 0x01, 0);
+    }
+
+    #[test]
+    fn parses_ble_options() {
+        let config = ServeConfig::parse(&[
+            "--ble-enable".into(),
+            "--btmgmt-path".into(),
+            "/run/current-system/sw/bin/btmgmt".into(),
+            "--ble-index".into(),
+            "1".into(),
+            "--ble-instance".into(),
+            "2".into(),
+            "--ble-duration".into(),
+            "30".into(),
+            "--ble-nearby-action".into(),
+            "900045d546".into(),
+            "--ble-nearby-info".into(),
+            "2204".into(),
+        ])
+        .unwrap();
+
+        assert!(config.ble.enabled);
+        assert_eq!(config.ble.btmgmt_path, "/run/current-system/sw/bin/btmgmt");
+        assert_eq!(config.ble.index, "1");
+        assert_eq!(config.ble.instance, 2);
+        assert_eq!(config.ble.duration, 30);
+        assert_eq!(config.ble.nearby_action.as_deref(), Some("900045d546"));
+        assert_eq!(config.ble.nearby_info.as_deref(), Some("2204"));
     }
 }

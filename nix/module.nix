@@ -18,6 +18,29 @@ let
     flag
     value
   ];
+  bleArgs =
+    lib.optionals cfg.ble.enable (
+      [
+        "--ble-enable"
+        "--btmgmt-path"
+        "${cfg.ble.bluezPackage}/bin/btmgmt"
+        "--ble-index"
+        cfg.ble.index
+        "--ble-instance"
+        (toString cfg.ble.instance)
+        "--ble-duration"
+        (toString cfg.ble.duration)
+        "--ble-length-flags"
+        (toString cfg.ble.lengthFlags)
+      ]
+      ++ optionalArg "--ble-flags" cfg.ble.flags
+      ++ optionalArg "--ble-nearby-action" cfg.ble.nearbyAction
+      ++ optionalArg "--ble-nearby-info" cfg.ble.nearbyInfo
+      ++ lib.concatMap (tlv: [
+        "--ble-tlv"
+        tlv
+      ]) cfg.ble.tlvs
+    );
   serviceArgs =
     [
       "${lib.getExe cfg.package}"
@@ -35,6 +58,7 @@ let
       "--txt"
       txt
     ]) cfg.txt
+    ++ bleArgs
     ++ cfg.extraArgs;
 in
 {
@@ -109,6 +133,68 @@ in
       description = "CompanionLink TXT key/value overrides or additions.";
     };
 
+    ble = {
+      enable = lib.mkEnableOption "Apple Continuity BLE NearbyAction/NearbyInfo advertising";
+
+      bluezPackage = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.bluez;
+        description = "BlueZ package providing btmgmt.";
+      };
+
+      index = lib.mkOption {
+        type = lib.types.str;
+        default = "0";
+        description = "BlueZ controller index, for example 0 for hci0.";
+      };
+
+      instance = lib.mkOption {
+        type = lib.types.ints.between 1 254;
+        default = 1;
+        description = "BlueZ advertising instance ID.";
+      };
+
+      duration = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 0;
+        description = "Advertising timeout in seconds. Zero omits btmgmt -t and leaves the instance persistent.";
+      };
+
+      flags = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "06";
+        description = "BLE flags payload hex. Null disables the flags AD structure.";
+      };
+
+      lengthFlags = lib.mkOption {
+        type = lib.types.ints.between 0 224;
+        default = 0;
+        description = "High three bits ORed into Continuity TLV length bytes.";
+      };
+
+      nearbyAction = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "0102030405";
+        description = "Continuity NearbyAction payload hex for TLV type 0x0f.";
+      };
+
+      nearbyInfo = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "0000";
+        description = "Continuity NearbyInfo payload hex for TLV type 0x10.";
+      };
+
+      tlvs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [
+          "10:0000"
+          "0f:0102030405"
+        ];
+        description = "Raw Continuity TLVs as TYPE:HEX entries.";
+      };
+    };
+
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -117,7 +203,8 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [ cfg.package ] ++ lib.optionals cfg.ble.enable [ cfg.ble.bluezPackage ];
+    hardware.bluetooth.enable = lib.mkDefault cfg.ble.enable;
 
     systemd.services.macolinux-uc = {
       description = "macolinux Universal Control Linux peer daemon";
@@ -127,6 +214,7 @@ in
         "bluetooth.service"
       ];
       wants = [ "network-online.target" ];
+      path = lib.optionals cfg.ble.enable [ cfg.ble.bluezPackage ];
       serviceConfig = {
         ExecStart = lib.escapeShellArgs serviceArgs;
         Restart = "on-failure";

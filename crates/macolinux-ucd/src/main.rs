@@ -6,6 +6,7 @@ use std::process;
 use macolinux_uc_core::rapport::{decode_many, RapportFrame};
 use macolinux_uc_core::tlv8::{decode_tlv8, encode_tlv8};
 
+mod ble;
 mod mdns;
 mod serve;
 
@@ -127,7 +128,7 @@ Usage:
   macolinux-ucd rapport encode FRAME_TYPE [BODY_HEX]
   macolinux-ucd serve [--instance NAME] [--hostname NAME.local] [--port PORT]
                      [--ipv4 ADDR] [--multicast-ipv4 ADDR]
-                     [--ble-address MAC] [--txt KEY=VALUE]
+                     [--ble-address MAC] [--txt KEY=VALUE] [--ble-enable]
 "
     );
 }
