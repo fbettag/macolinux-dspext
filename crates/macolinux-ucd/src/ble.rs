@@ -124,7 +124,14 @@ impl BleConfig {
         }
         add_adv.push(&instance);
         run_btmgmt(&self.btmgmt_path, &self.index, &add_adv, false)?;
+        run_btmgmt(
+            &self.btmgmt_path,
+            &self.index,
+            &["advertising", "on"],
+            false,
+        )?;
         run_btmgmt(&self.btmgmt_path, &self.index, &["info"], false)?;
+        run_btmgmt(&self.btmgmt_path, &self.index, &["advinfo"], false)?;
         Ok(())
     }
 }

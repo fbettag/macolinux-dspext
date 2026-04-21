@@ -594,6 +594,49 @@ Current inference: BLE and Bonjour correlation is real, but it still only
 creates an unauthenticated non-AWDL CompanionLink peer. macOS does not attempt
 the TCP `RPConnection` stream for that state.
 
+The NixOS-deployed Rust daemon reproduced the same state with real Linux
+Bluetooth hardware. `fistel` advertised this legacy BLE payload:
+
+```text
+02 01 06
+0e ff 4c 00 10 02 22 04 0f 05 90 00 45 d5 46
+```
+
+macOS `sharingd` accepted both Continuity TLVs:
+
+```text
+BLE NearbyAction found ... AdvD <900045d546> ... Paired no, Cnx no, WiFiP2P
+BLE NearbyInfo found ... AdvD <2204> ... Paired no, Cnx no, WiFiP2P
+```
+
+The same logs repeatedly rejected the synthetic device at the identification
+layer:
+
+```text
+Max identification devices reached, skipping ... WiFiP2P,
+DF 0x220 < Ranging DeviceClose >, DT Generic, AcLv ? (16)
+```
+
+By contrast, an already accepted Universal Control peer is reported by
+`rapportd` as a paired iCloud/IDS identity:
+
+```text
+BLE device changed ... IDS ..., AltDSID ..., AID ..., DuetSync,
+MRI ..., MRtI ..., PairedBT, PairedSys Conjectured, rapportID ...,
+WiFiP2P, DF 0x29 < MyMe MyiCloud Ranging >, ARS Idle, DT Generic
+```
+
+When the real peer is user-active, the same device can temporarily include
+`AirDrop` and `ARS High`, but the stable admission difference is the paired
+system/iCloud identity state, not the raw NearbyAction value.
+
+Bonjour comparisons also show that normal CompanionLink records are mostly
+low-entropy routing and identity hints. Real peers on the LAN advertise
+`rpFl=0x20000`, six-byte `rpHA`, six-byte `rpAD`, six-byte `rpHI`, `rpVr=715.2`,
+and a Bluetooth address in `rpBA`. `fistel` resolves and correlates with BLE,
+but changing `rpFl` and adding `rpMd` does not create the paired identity state
+that Universal Control requires.
+
 ## Bonjour `rpFl` To Rapport Status Flags
 
 `-[RPEndpoint updateWithBonjourDevice:]` reads the Bonjour TXT key `rpFl` and
