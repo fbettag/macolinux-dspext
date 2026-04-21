@@ -843,20 +843,38 @@ Live TCP bootstrap status:
 - PairSetup/PairVerify payloads are OPACK dictionaries using the short key
   `_pd` for TLV8 data. Top-level OPACK data is rejected as a bad object type,
   and the long dictionary key `pairingInfo` is treated as missing pairing data.
-- `PairVerifyStart` (`0x05`) with `_pd = 03 20 <32-byte X25519 public key>`
-  reaches CoreUtils `PairVerifyServer` and returns `PairVerifyNext` (`0x06`)
-  with `_pd = 07 01 04 06 01 00`. Adding method `00 01 02` yields the same
-  response. This means TCP framing, OPACK, `_pd`, and the M1 public-key TLV are
-  now correct; the remaining failure is the trust/identity side of PairVerify.
+- `PairVerifyStart` (`0x05`) with only `_pd = 03 20 <32-byte X25519 public
+  key>` reaches CoreUtils `PairVerifyServer`, but returns error 4 at state 0.
+  The live TCP M1 shape that gets a real M2 is
+  `06 01 01 03 20 <32-byte X25519 public key> 19 01 01`: state 1, public key,
+  and app flags 1.
 - The Rust probe now generates the PairVerify M1 X25519 keypair itself. For a
   normal M2 it derives the HKDF-SHA512 `Pair-Verify-Encrypt` key, decrypts
   `PV-Msg02`, optionally verifies the peer Ed25519 signature, and can build
   encrypted M3 (`PV-Msg03`) from a supplied Linux identity.
 - `macolinux-ucd identity create` now persists a versioned Linux Ed25519
   identity JSON file. `pairing resolve --pairverify-client --identity PATH`
-  consumes that file for M3 signing. The live `endor` listener currently
-  returns the same error TLV before sending a server public key, so the next
-  blocker remains trust bootstrap rather than wire shape.
+  consumes that file for M3 signing. The live `endor` listener now accepts M1,
+  returns a decryptable M2, and receives our encrypted M3, then replies with
+  `_pd = 07 01 04 06 01 03` (`Error=4`, `State=3`).
+- A unified-log capture of that M3 failure shows the concrete server-side
+  reason:
+  `Resolve identity for signature failed` for
+  `< SameAccountDevices FamilyDevices FriendDevices SharedTVUserDevices SessionPairedDevices >`,
+  followed by `PairVerifyVerify failed: kNotFoundErr (Resolved identity not
+  found)` and `PairVerify server M3 verify signature failed`. This means the
+  remaining blocker is not the M3 encryption envelope; `rapportd` cannot resolve
+  the Linux peer identifier as an allowed `RPIdentity`.
+- Direct CoreUtils C API probing found `PairingSessionCreate`,
+  `PairingSessionSavePeer`, and `PairingSessionFindPeer`. Calling
+  `PairingSessionSavePeer` writes a peer that the same helper process can find,
+  but `rapportd` still fails `RPIdentityDaemon` resolution. Testing
+  `PairingSessionCreate` types 1 through 12 did not change the M3 result.
+- Runtime probing maps `RPIdentity` type 13 to `SessionPaired`; type 15 is
+  `AdHocPairedDevice`. `RPClient addOrUpdateIdentity:source:completion:` is the
+  obvious daemon-facing API for installing this identity, but normal, root, and
+  ad-hoc-signed helpers fail with missing or restricted
+  `com.apple.rapport.Client` entitlement.
 
 Current inference: root access alone is not enough for a clean bootstrap,
 because macOS enforces this through code-signing entitlements and keychain

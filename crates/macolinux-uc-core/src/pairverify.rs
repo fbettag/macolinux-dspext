@@ -146,7 +146,11 @@ pub fn pairing_stream_info(stream_name: &str, client_to_server: bool) -> Vec<u8>
 }
 
 pub fn build_pairverify_m1(public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH]) -> Vec<u8> {
-    encode_tlv8(&[(TLV_PUBLIC_KEY, public_key)])
+    encode_tlv8(&[
+        (TLV_STATE, &[1]),
+        (TLV_PUBLIC_KEY, public_key),
+        (TLV_APP_FLAGS, &[1]),
+    ])
 }
 
 pub fn generate_ed25519_seed() -> [u8; PAIRVERIFY_KEY_LENGTH] {
@@ -403,10 +407,11 @@ mod tests {
     #[test]
     fn pairverify_m1_contains_public_key() {
         let public_key = [0xa5; 32];
-        assert_eq!(
-            build_pairverify_m1(&public_key),
-            [&[TLV_PUBLIC_KEY, 32], public_key.as_slice()].concat()
-        );
+        let mut expected = Vec::from([TLV_STATE, 1, 1, TLV_PUBLIC_KEY, 32]);
+        expected.extend_from_slice(&public_key);
+        expected.extend_from_slice(&[TLV_APP_FLAGS, 1, 1]);
+
+        assert_eq!(build_pairverify_m1(&public_key), expected);
     }
 
     #[test]

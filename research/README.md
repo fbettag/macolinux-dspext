@@ -129,15 +129,22 @@ clang -fobjc-arc -framework Foundation -framework Security \
 /tmp/continuity-inspect protocol Rapport.RPPairingDaemonXPCInterface
 /tmp/continuity-inspect pairing-summary
 /tmp/continuity-inspect auth-types 16
+/tmp/continuity-inspect coreutils-symbols
+/tmp/continuity-inspect methods SessionPaired
+/tmp/continuity-inspect rpidentity-peer /tmp/fistel-peer.json 24
+/tmp/continuity-inspect rpclient-add-identity /tmp/fistel-peer.json 13 0
 /tmp/continuity-inspect rp-pairing-listen 10 visible
 /tmp/continuity-inspect rd-pairing-server 10
 ```
 
-Normal unsigned processes currently receive `kMissingEntitlementErr` from the
-PairingManager read APIs. That is expected and is useful: a clean Linux peer
-bootstrap cannot rely on cloning an existing Mac's Universal Control identity.
-It needs a separate pairing path for a new `CUPairedPeer`/`RPIdentity` or an
-entitled macOS helper.
+Normal unsigned processes currently receive `kMissingEntitlementErr` from both
+the PairingManager APIs and the `RPClient` identity APIs. Ad-hoc signing with
+restricted Apple entitlements such as `com.apple.rapport.Client` or
+`com.apple.PairingManager.Write` makes the helper die at launch under AMFI, so
+this is not bypassed by root or local codesigning. That is expected and is
+useful: a clean Linux peer bootstrap cannot rely on cloning an existing Mac's
+Universal Control identity. It needs a separate pairing path for a new
+`CUPairedPeer`/`RPIdentity` or a genuinely entitled macOS helper.
 
 The `auth-types` and `rp-pairing-listen` probes are also read-only. On the
 current test host, Sharing authentication type enumeration works, but actual
