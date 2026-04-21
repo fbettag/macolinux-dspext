@@ -99,7 +99,10 @@ clang -fobjc-arc -framework Foundation -framework Security \
   -o /tmp/continuity-inspect
 /tmp/continuity-inspect classes Pairing
 /tmp/continuity-inspect class CUPairingManager
+/tmp/continuity-inspect protocol Rapport.RPPairingDaemonXPCInterface
 /tmp/continuity-inspect pairing-summary
+/tmp/continuity-inspect auth-types 16
+/tmp/continuity-inspect rp-pairing-listen 10 visible
 ```
 
 Normal unsigned processes currently receive `kMissingEntitlementErr` from the
@@ -107,6 +110,13 @@ PairingManager read APIs. That is expected and is useful: a clean Linux peer
 bootstrap cannot rely on cloning an existing Mac's Universal Control identity.
 It needs a separate pairing path for a new `CUPairedPeer`/`RPIdentity` or an
 entitled macOS helper.
+
+The `auth-types` and `rp-pairing-listen` probes are also read-only. On the
+current test host, Sharing authentication type enumeration works, but actual
+candidate/eligible device listing is rejected by `sharingd` without the private
+authentication/unlock entitlement. Rapport's pairing receiver controller can be
+started by an ordinary process, but it does not emit a PIN by itself; it appears
+to wait for an incoming pairing initiator.
 
 Advertise a synthetic Apple Continuity BLE NearbyAction/NearbyInfo payload from
 a Linux BlueZ host:

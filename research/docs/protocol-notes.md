@@ -774,6 +774,29 @@ daemon entitlements:
 - `UniversalControl` itself has display/HID/CompanionLink entitlements, but it
   does not appear to be the daemon that owns PairingManager writes.
 
+Additional read-only probes on the current host:
+
+- `SFAuthenticationManager` reports local support for authentication types 5
+  (`MacApprovePhone`), 6 (`Registration`), and 7
+  (`GuestModeUnlockPairing`). Candidate/eligible device enumeration for those
+  types does not complete from an unsigned client, and `sharingd` logs that the
+  client lacks the private authentication/unlock entitlement.
+- `Rapport.RPPairingReceiverController` can be started by an ordinary process.
+  `rapportd` logs `Start pairing receiver controller`, then stops it when the
+  process exits. Setting `pairingValueUIVisible` to true does not produce a
+  `RPPairingPINInfo` without an incoming pairing initiator.
+- Runtime protocol metadata shows the receiver XPC surface is intentionally
+  small:
+
+```text
+Rapport.RPPairingDaemonXPCInterface:
+  startPairingReceiverController:
+  pairingValueUIVisibleUpdated:
+
+Rapport.RPPairingReceiverControllerXPCClientInterface:
+  pairingValueUpdated:
+```
+
 Current inference: root access alone is not enough for a clean bootstrap,
 because macOS enforces this through code-signing entitlements and keychain
 access groups. The clean product direction is a two-sided pairing flow:

@@ -122,6 +122,39 @@ static void PrintClassInfo(NSString *className) {
     PrintMethods(cls, YES);
 }
 
+static void PrintProtocolMethods(Protocol *protocol, BOOL required, BOOL instance) {
+    unsigned int count = 0;
+    struct objc_method_description *methods =
+        protocol_copyMethodDescriptionList(protocol, required, instance, &count);
+    printf("%s %s methods (%u):\n",
+           required ? "required" : "optional",
+           instance ? "instance" : "class",
+           count);
+    for (unsigned int i = 0; i < count; i++) {
+        printf("  %c%s %s\n",
+               instance ? '-' : '+',
+               sel_getName(methods[i].name),
+               methods[i].types ?: "");
+    }
+    free(methods);
+}
+
+static void PrintProtocolInfo(NSString *protocolName) {
+    LoadContinuityFrameworks();
+
+    Protocol *protocol = objc_getProtocol(protocolName.UTF8String);
+    if (!protocol) {
+        fprintf(stderr, "protocol not found: %s\n", protocolName.UTF8String);
+        return;
+    }
+
+    printf("protocol %s\n", protocol_getName(protocol));
+    PrintProtocolMethods(protocol, YES, YES);
+    PrintProtocolMethods(protocol, NO, YES);
+    PrintProtocolMethods(protocol, YES, NO);
+    PrintProtocolMethods(protocol, NO, NO);
+}
+
 static NSDictionary *KeychainQuery(CFTypeRef secClass) {
     return @{
         (__bridge id)kSecClass: (__bridge id)secClass,
@@ -262,6 +295,265 @@ static NSString *DescribeString(id object) {
     return object ? NSStringFromClass([object class]) : @"nil";
 }
 
+static BOOL WaitForSemaphore(dispatch_semaphore_t sem, NSTimeInterval timeout) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)) != 0) {
+        if ([deadline timeIntervalSinceNow] <= 0) {
+            return NO;
+        }
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+    return YES;
+}
+
+static id SafeValueForKey(id object, NSString *key) {
+    if (!object) {
+        return nil;
+    }
+    @try {
+        return [object valueForKey:key];
+    } @catch (NSException *exception) {
+        return nil;
+    }
+}
+
+static BOOL ReadBoolSelector(id object, SEL selector, BOOL *valueOut) {
+    if (!object || ![object respondsToSelector:selector]) {
+        return NO;
+    }
+    typedef BOOL (*BoolFn)(id, SEL);
+    BoolFn fn = (BoolFn)[object methodForSelector:selector];
+    *valueOut = fn(object, selector);
+    return YES;
+}
+
+static NSString *AuthTypeName(NSUInteger type) {
+    NSDictionary<NSNumber *, NSString *> *names = @{
+        @0: @"Unknown",
+        @1: @"Siri",
+        @2: @"NanoWallet",
+        @3: @"MacUnlockPhonePairing",
+        @4: @"MacUnlockPhone",
+        @5: @"MacApprovePhone",
+        @6: @"Registration",
+        @7: @"GuestModeUnlockPairing",
+        @8: @"GuestModeUnlock",
+        @9: @"VisionUnlockiOSPairing",
+        @10: @"VisionUnlockiOS",
+        @11: @"VisionApproveiOS",
+    };
+    return names[@(type)] ?: @"";
+}
+
+static id NewAuthenticationManager(void) {
+    Class managerClass = NSClassFromString(@"SFAuthenticationManager");
+    if (!managerClass) {
+        return nil;
+    }
+
+    id manager = [managerClass alloc];
+    SEL initWithQueueSelector = @selector(initWithQueue:);
+    if ([manager respondsToSelector:initWithQueueSelector]) {
+        typedef id (*InitWithQueueFn)(id, SEL, dispatch_queue_t);
+        InitWithQueueFn fn = (InitWithQueueFn)[manager methodForSelector:initWithQueueSelector];
+        return fn(manager, initWithQueueSelector, dispatch_get_main_queue());
+    }
+    return [manager init];
+}
+
+static void PrintAuthenticationDeviceShape(id device, NSUInteger index) {
+    id idsDeviceID = SafeValueForKey(device, @"idsDeviceID");
+    id modelDescription = SafeValueForKey(device, @"modelDescription");
+    BOOL enabledAsKey = NO;
+    BOOL enabledAsLock = NO;
+    BOOL bluetoothCloudPaired = NO;
+    BOOL hasKey = ReadBoolSelector(device, @selector(enabledAsKey), &enabledAsKey);
+    BOOL hasLock = ReadBoolSelector(device, @selector(enabledAsLock), &enabledAsLock);
+    BOOL hasCloudPaired = ReadBoolSelector(device, @selector(bluetoothCloudPaired), &bluetoothCloudPaired);
+
+    printf("      device %lu:\n", (unsigned long)index);
+    printf("        class: %s\n", class_getName([device class]));
+    printf("        idsDeviceID: %s\n", DescribeString(idsDeviceID).UTF8String);
+    printf("        modelDescription: %s\n", DescribeString(modelDescription).UTF8String);
+    if (hasKey) {
+        printf("        enabledAsKey: %s\n", enabledAsKey ? "yes" : "no");
+    }
+    if (hasLock) {
+        printf("        enabledAsLock: %s\n", enabledAsLock ? "yes" : "no");
+    }
+    if (hasCloudPaired) {
+        printf("        bluetoothCloudPaired: %s\n", bluetoothCloudPaired ? "yes" : "no");
+    }
+}
+
+static void PrintAuthenticationDeviceList(NSString *label, NSArray *devices, NSError *error) {
+    if (error) {
+        printf("    %s error: %s\n", label.UTF8String, error.description.UTF8String);
+        return;
+    }
+    printf("    %s devices: %lu\n", label.UTF8String, (unsigned long)devices.count);
+    NSUInteger index = 0;
+    for (id device in devices) {
+        PrintAuthenticationDeviceShape(device, index++);
+    }
+}
+
+static void ProbeAuthenticationTypes(NSUInteger maxType) {
+    LoadContinuityFrameworks();
+
+    id manager = NewAuthenticationManager();
+    if (!manager) {
+        fprintf(stderr, "SFAuthenticationManager not found\n");
+        return;
+    }
+
+    SEL supportedSelector = @selector(isSupportedForType:);
+    SEL enabledSelector = @selector(isEnabledForType:);
+    SEL candidatesSelector = @selector(listCandidateDevicesForType:completionHandler:);
+    SEL eligibleSelector = @selector(listEligibleDevicesForType:completionHandler:);
+
+    for (NSUInteger type = 0; type <= maxType; type++) {
+        BOOL supported = NO;
+        BOOL enabled = NO;
+        BOOL hasSupported = NO;
+        BOOL hasEnabled = NO;
+
+        if ([manager respondsToSelector:supportedSelector]) {
+            typedef BOOL (*BoolTypeFn)(id, SEL, NSUInteger);
+            BoolTypeFn fn = (BoolTypeFn)[manager methodForSelector:supportedSelector];
+            supported = fn(manager, supportedSelector, type);
+            hasSupported = YES;
+        }
+        if ([manager respondsToSelector:enabledSelector]) {
+            typedef BOOL (*BoolTypeFn)(id, SEL, NSUInteger);
+            BoolTypeFn fn = (BoolTypeFn)[manager methodForSelector:enabledSelector];
+            enabled = fn(manager, enabledSelector, type);
+            hasEnabled = YES;
+        }
+
+        NSString *name = AuthTypeName(type);
+        printf("type %lu%s%s\n",
+               (unsigned long)type,
+               name.length ? " " : "",
+               name.length ? name.UTF8String : "");
+        if (hasSupported) {
+            printf("  supported: %s\n", supported ? "yes" : "no");
+        } else {
+            puts("  supported: method unavailable");
+        }
+        if (hasEnabled) {
+            printf("  enabled: %s\n", enabled ? "yes" : "no");
+        } else {
+            puts("  enabled: method unavailable");
+        }
+
+        if ([manager respondsToSelector:candidatesSelector]) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            typedef void (*ListFn)(id, SEL, NSUInteger, void (^)(NSArray *, NSError *));
+            ListFn fn = (ListFn)[manager methodForSelector:candidatesSelector];
+            fn(manager, candidatesSelector, type, ^(NSArray *devices, NSError *error) {
+                PrintAuthenticationDeviceList(@"candidate", devices, error);
+                dispatch_semaphore_signal(sem);
+            });
+            if (!WaitForSemaphore(sem, 3.0)) {
+                puts("    candidate timeout");
+            }
+        }
+
+        if ([manager respondsToSelector:eligibleSelector]) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            typedef void (*ListFn)(id, SEL, NSUInteger, void (^)(NSArray *, NSError *));
+            ListFn fn = (ListFn)[manager methodForSelector:eligibleSelector];
+            fn(manager, eligibleSelector, type, ^(NSArray *devices, NSError *error) {
+                PrintAuthenticationDeviceList(@"eligible", devices, error);
+                dispatch_semaphore_signal(sem);
+            });
+            if (!WaitForSemaphore(sem, 3.0)) {
+                puts("    eligible timeout");
+            }
+        }
+    }
+}
+
+static void ProbeRPPairingListen(NSTimeInterval seconds, BOOL uiVisible) {
+    LoadContinuityFrameworks();
+
+    Class controllerClass = NSClassFromString(@"Rapport.RPPairingReceiverController");
+    if (!controllerClass) {
+        fprintf(stderr, "Rapport.RPPairingReceiverController not found\n");
+        return;
+    }
+
+    id controller = [controllerClass alloc];
+    SEL initWithQueueSelector = @selector(initWithQueue:);
+    if ([controller respondsToSelector:initWithQueueSelector]) {
+        typedef id (*InitWithQueueFn)(id, SEL, dispatch_queue_t);
+        InitWithQueueFn fn = (InitWithQueueFn)[controller methodForSelector:initWithQueueSelector];
+        controller = fn(controller, initWithQueueSelector, dispatch_get_main_queue());
+    } else {
+        controller = [controller init];
+    }
+
+    if (!controller) {
+        fprintf(stderr, "failed to create RPPairingReceiverController\n");
+        return;
+    }
+
+    __block NSUInteger eventCount = 0;
+    id handler = ^(id value) {
+        eventCount++;
+        printf("pairing event %lu: class=%s description=%s\n",
+               (unsigned long)eventCount,
+               value ? class_getName([value class]) : "nil",
+               RedactedLength(value).UTF8String);
+    };
+
+    SEL setHandlerSelector = @selector(setPairingValueUpdatedHandler:);
+    if ([controller respondsToSelector:setHandlerSelector]) {
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[controller methodForSelector:setHandlerSelector];
+        fn(controller, setHandlerSelector, [handler copy]);
+    } else {
+        puts("pairingValueUpdatedHandler setter unavailable");
+    }
+
+    SEL setVisibleSelector = @selector(setPairingValueUIVisible:);
+    typedef void (*SetBoolFn)(id, SEL, BOOL);
+    SetBoolFn setVisible = NULL;
+    if ([controller respondsToSelector:setVisibleSelector]) {
+        setVisible = (SetBoolFn)[controller methodForSelector:setVisibleSelector];
+        setVisible(controller, setVisibleSelector, uiVisible);
+        printf("pairing UI visible: %s\n", uiVisible ? "yes" : "no");
+    } else {
+        puts("pairingValueUIVisible setter unavailable");
+    }
+
+    SEL startSelector = @selector(start);
+    if (![controller respondsToSelector:startSelector]) {
+        puts("start method unavailable");
+        return;
+    }
+    typedef void (*VoidFn)(id, SEL);
+    VoidFn start = (VoidFn)[controller methodForSelector:startSelector];
+    start(controller, startSelector);
+    if (setVisible) {
+        setVisible(controller, setVisibleSelector, uiVisible);
+    }
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+
+    SEL stopSelector = @selector(stop);
+    if ([controller respondsToSelector:stopSelector]) {
+        VoidFn stop = (VoidFn)[controller methodForSelector:stopSelector];
+        stop(controller, stopSelector);
+    }
+
+    printf("pairing events observed: %lu\n", (unsigned long)eventCount);
+}
+
 static void PrintPairingIdentityShape(id identity) {
     if (!identity) {
         puts("pairing identity: nil");
@@ -357,8 +649,8 @@ static void PrintPairingSummary(void) {
             PrintPairingIdentityShape(identity);
             dispatch_semaphore_signal(identitySem);
         });
-        while (dispatch_semaphore_wait(identitySem, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)) != 0) {
-            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        if (!WaitForSemaphore(identitySem, 5.0)) {
+            puts("pairing identity timeout");
         }
     } else {
         puts("pairing identity: method unavailable");
@@ -380,8 +672,8 @@ static void PrintPairingSummary(void) {
             }
             dispatch_semaphore_signal(peersSem);
         });
-        while (dispatch_semaphore_wait(peersSem, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)) != 0) {
-            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        if (!WaitForSemaphore(peersSem, 5.0)) {
+            puts("paired peers timeout");
         }
     } else {
         puts("paired peers: method unavailable");
@@ -392,8 +684,11 @@ static void Usage(const char *argv0) {
     fprintf(stderr, "usage:\n");
     fprintf(stderr, "  %s classes [FILTER]\n", argv0);
     fprintf(stderr, "  %s class CLASSNAME\n", argv0);
+    fprintf(stderr, "  %s protocol PROTOCOLNAME\n", argv0);
     fprintf(stderr, "  %s pairing-summary\n", argv0);
     fprintf(stderr, "  %s keychain-summary\n", argv0);
+    fprintf(stderr, "  %s auth-types [MAX_TYPE]\n", argv0);
+    fprintf(stderr, "  %s rp-pairing-listen [SECONDS] [visible]\n", argv0);
     fprintf(stderr, "\n");
     fprintf(stderr, "This tool is read-only and redacts keychain/private-key values by default.\n");
 }
@@ -415,12 +710,30 @@ int main(int argc, const char *argv[]) {
             PrintClassInfo([NSString stringWithUTF8String:argv[2]]);
             return 0;
         }
+        if ([command isEqualToString:@"protocol"] && argc == 3) {
+            PrintProtocolInfo([NSString stringWithUTF8String:argv[2]]);
+            return 0;
+        }
         if ([command isEqualToString:@"pairing-summary"]) {
             PrintPairingSummary();
             return 0;
         }
         if ([command isEqualToString:@"keychain-summary"]) {
             PrintKeychainSummary();
+            return 0;
+        }
+        if ([command isEqualToString:@"auth-types"]) {
+            NSUInteger maxType = argc >= 3 ? (NSUInteger)strtoul(argv[2], NULL, 0) : 16;
+            ProbeAuthenticationTypes(maxType);
+            return 0;
+        }
+        if ([command isEqualToString:@"rp-pairing-listen"]) {
+            NSTimeInterval seconds = argc >= 3 ? strtod(argv[2], NULL) : 10.0;
+            BOOL uiVisible = argc >= 4 && strcmp(argv[3], "visible") == 0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            ProbeRPPairingListen(seconds, uiVisible);
             return 0;
         }
 
