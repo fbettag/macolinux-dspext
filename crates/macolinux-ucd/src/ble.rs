@@ -115,12 +115,6 @@ impl BleConfig {
     }
 
     fn apply_advertisement(&self, adv_hex: &str) -> Result<(), Box<dyn Error>> {
-        run_btmgmt(&self.btmgmt_path, &self.index, &["info"], true)?;
-        run_btmgmt(&self.btmgmt_path, &self.index, &["power", "off"], true)?;
-        run_btmgmt(&self.btmgmt_path, &self.index, &["le", "on"], true)?;
-        run_btmgmt(&self.btmgmt_path, &self.index, &["bredr", "off"], true)?;
-        run_btmgmt(&self.btmgmt_path, &self.index, &["connectable", "on"], true)?;
-        run_btmgmt(&self.btmgmt_path, &self.index, &["power", "on"], false)?;
         run_btmgmt(&self.btmgmt_path, &self.index, &["clr-adv"], true)?;
 
         let instance = self.instance.to_string();
