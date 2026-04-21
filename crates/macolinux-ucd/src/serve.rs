@@ -54,7 +54,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     });
 
-    MdnsAdvert {
+    run_mdns_advertiser(MdnsAdvert {
         service_type: SERVICE_TYPE.into(),
         instance: config.instance,
         hostname: config.hostname,
@@ -62,8 +62,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         ipv4,
         multicast_ipv4,
         txt,
-    }
-    .run()
+    })
 }
 
 impl ServeConfig {
@@ -180,6 +179,15 @@ fn run_tcp_listener(port: u16) -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn run_mdns_advertiser(advert: MdnsAdvert) -> ! {
+    loop {
+        if let Err(err) = advert.run() {
+            eprintln!("mDNS advertiser failed: {err}; retrying in 5s");
+            thread::sleep(Duration::from_secs(5));
+        }
+    }
 }
 
 fn handle_tcp_client(mut stream: TcpStream) -> Result<(), Box<dyn Error>> {

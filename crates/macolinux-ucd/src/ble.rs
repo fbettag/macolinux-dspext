@@ -27,9 +27,13 @@ pub struct BleConfig {
 
 impl BleConfig {
     pub fn start(self) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            if let Err(err) = self.run() {
-                eprintln!("BLE advertiser failed: {err}");
+        thread::spawn(move || loop {
+            match self.run() {
+                Ok(()) => return,
+                Err(err) => {
+                    eprintln!("BLE advertiser failed: {err}; retrying in 5s");
+                    thread::sleep(Duration::from_secs(5));
+                }
             }
         })
     }
