@@ -8,4 +8,4 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/macolinux-dspext"
+repository = "https://github.com/fbettag/macolinux-dspext"

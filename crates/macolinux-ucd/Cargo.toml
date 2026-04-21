@@ -11,3 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 macolinux-uc-core = { path = "../macolinux-uc-core" }
+socket2 = "0.6.3"

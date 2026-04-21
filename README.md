@@ -15,9 +15,11 @@ live under `research/` as reverse-engineering scaffolding.
   - Rapport frame encode/decode
   - Bonjour `rpFl` to Rapport status flag mapping
   - PairVerify constants recovered from CoreUtils
-- `crates/macolinux-ucd` is a daemon skeleton with inspection subcommands.
+- `crates/macolinux-ucd` has inspection subcommands plus an experimental
+  CompanionLink mDNS advertiser and TCP Rapport frame logger.
 - `nix/module.nix` exposes a NixOS service module, but the service is still a
-  placeholder until discovery, PairVerify, and `uinput` are implemented.
+  research probe until PairVerify, encrypted OPACK, and `uinput` are
+  implemented.
 
 ## Development
 
@@ -26,6 +28,7 @@ cargo test
 cargo run -p macolinux-ucd -- --version
 cargo run -p macolinux-ucd -- tlv8 decode '0601010303616263'
 cargo run -p macolinux-ucd -- rapport dump '08000003010203'
+cargo run -p macolinux-ucd -- serve --help
 ```
 
 Build through Nix:
@@ -42,10 +45,13 @@ a NixOS host should import this module and enable:
 
 ```nix
 services.macolinux-uc.enable = true;
+services.macolinux-uc.instance = "linux-peer";
+services.macolinux-uc.ipv4 = "192.0.2.11";
+services.macolinux-uc.bleAddress = "02:00:00:00:00:31";
 ```
 
-Do not deploy the service to a production host yet; the daemon currently only starts a
-skeleton `serve` command.
+Do not deploy the service to a production host yet; `serve` is currently a
+CompanionLink visibility probe, not a working Universal Control peer.
 
 ## Research
 

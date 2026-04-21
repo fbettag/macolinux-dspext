@@ -6,6 +6,9 @@ use std::process;
 use macolinux_uc_core::rapport::{decode_many, RapportFrame};
 use macolinux_uc_core::tlv8::{decode_tlv8, encode_tlv8};
 
+mod mdns;
+mod serve;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
@@ -23,10 +26,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         Some("tlv8") => run_tlv8(&args[2..]),
         Some("rapport") => run_rapport(&args[2..]),
-        Some("serve") => {
-            println!("daemon skeleton only; discovery/pairverify runtime is not implemented yet");
-            Ok(())
-        }
+        Some("serve") => serve::run(&args[2..]),
         Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())
@@ -125,7 +125,9 @@ Usage:
   macolinux-ucd tlv8 encode TYPE=HEX ...
   macolinux-ucd rapport dump HEX
   macolinux-ucd rapport encode FRAME_TYPE [BODY_HEX]
-  macolinux-ucd serve
+  macolinux-ucd serve [--instance NAME] [--hostname NAME.local] [--port PORT]
+                     [--ipv4 ADDR] [--multicast-ipv4 ADDR]
+                     [--ble-address MAC] [--txt KEY=VALUE]
 "
     );
 }
