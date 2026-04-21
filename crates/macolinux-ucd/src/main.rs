@@ -7,6 +7,7 @@ use macolinux_uc_core::rapport::{decode_many, RapportFrame};
 use macolinux_uc_core::tlv8::{decode_tlv8, encode_tlv8};
 
 mod ble;
+mod identity;
 mod mdns;
 mod pairing;
 mod serve;
@@ -28,6 +29,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         Some("tlv8") => run_tlv8(&args[2..]),
         Some("rapport") => run_rapport(&args[2..]),
+        Some("identity") => identity::run(&args[2..]),
         Some("pairing") => pairing::run(&args[2..]),
         Some("serve") => serve::run(&args[2..]),
         Some("-h") | Some("--help") | None => {
@@ -128,6 +130,9 @@ Usage:
   macolinux-ucd tlv8 encode TYPE=HEX ...
   macolinux-ucd rapport dump HEX
   macolinux-ucd rapport encode FRAME_TYPE [BODY_HEX]
+  macolinux-ucd identity create [--path PATH] [--identifier TEXT] [--force]
+  macolinux-ucd identity show [--path PATH] [--show-secret]
+  macolinux-ucd identity export-peer [--path PATH]
   macolinux-ucd pairing resolve --addr HOST:PORT [--frame 0x07] [--shape companion-empty-request]
   macolinux-ucd serve [--instance NAME] [--hostname NAME.local] [--port PORT]
                      [--ipv4 ADDR] [--multicast-ipv4 ADDR]

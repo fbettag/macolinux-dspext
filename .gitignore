@@ -19,3 +19,6 @@ __pycache__/
 *.tar.gz
 *.tgz
 *.xz
+
+# Local Linux peer identity files include private Ed25519 seed material.
+*.identity.json

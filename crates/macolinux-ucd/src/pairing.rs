@@ -2,8 +2,10 @@ use std::error::Error;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::identity::LinuxIdentity;
 use macolinux_uc_core::opack::{decode_opack, dict, empty_dict, encode_opack, OpackValue};
 use macolinux_uc_core::pairverify::{
     build_pairverify_m1, build_pairverify_m3, build_pairverify_m3_plaintext, derive_pairverify_key,
@@ -24,6 +26,7 @@ struct ResolveConfig {
     pairing_info: Option<Vec<u8>>,
     opack_data: Option<Vec<u8>>,
     pairverify_client: bool,
+    identity_path: Option<PathBuf>,
     identity_id: Option<Vec<u8>>,
     identity_seed: Option<Vec<u8>>,
     peer_signing_key: Option<Vec<u8>>,
@@ -48,7 +51,8 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_resolve(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let config = ResolveConfig::parse(args)?;
+    let mut config = ResolveConfig::parse(args)?;
+    config.load_identity_file()?;
     let addr = resolve_addr(&config.addr)?;
 
     println!(
@@ -105,6 +109,7 @@ impl ResolveConfig {
             pairing_info: None,
             opack_data: None,
             pairverify_client: false,
+            identity_path: None,
             identity_id: None,
             identity_seed: None,
             peer_signing_key: None,
@@ -142,6 +147,9 @@ impl ResolveConfig {
                     config.pairverify_client = true;
                     config.frame_type = 0x05;
                 }
+                "--identity" => {
+                    config.identity_path = Some(PathBuf::from(next_value(&mut iter, arg)?))
+                }
                 "--identity-id" => config.identity_id = Some(next_value(&mut iter, arg)?.into()),
                 "--identity-id-hex" => {
                     let value = next_value(&mut iter, arg)?;
@@ -162,6 +170,30 @@ impl ResolveConfig {
         }
 
         Ok(config)
+    }
+
+    fn load_identity_file(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(path) = &self.identity_path else {
+            return Ok(());
+        };
+        if self.identity_id.is_some() || self.identity_seed.is_some() {
+            return Err(PairingError(
+                "--identity cannot be combined with --identity-id, --identity-id-hex, or --identity-ed25519-seed-hex"
+                    .into(),
+            )
+            .into());
+        }
+
+        let identity = LinuxIdentity::load(path)?;
+        println!(
+            "pairverify_identity_path={} identifier={} ed25519_public_key_hex={}",
+            path.display(),
+            identity.identifier,
+            identity.ed25519_public_key_hex
+        );
+        self.identity_id = Some(identity.identifier_bytes());
+        self.identity_seed = Some(identity.ed25519_seed()?);
+        Ok(())
     }
 
     fn opack_value(&self, pairverify_key_pair: Option<&PairVerifyKeyPair>) -> OpackValue {
@@ -526,6 +558,7 @@ fn usage() -> String {
                               [--pairverify-client]
                               [--pairing-info-hex TLV8_HEX] [--data-key KEY]
                               [--opack-data-hex HEX]
+                              [--identity PATH]
                               [--identity-id TEXT|--identity-id-hex HEX]
                               [--identity-ed25519-seed-hex HEX]
                               [--peer-ed25519-public-key-hex HEX]

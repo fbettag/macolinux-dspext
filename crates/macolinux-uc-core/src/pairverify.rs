@@ -5,7 +5,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use sha2::Sha512;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -147,6 +147,19 @@ pub fn pairing_stream_info(stream_name: &str, client_to_server: bool) -> Vec<u8>
 
 pub fn build_pairverify_m1(public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH]) -> Vec<u8> {
     encode_tlv8(&[(TLV_PUBLIC_KEY, public_key)])
+}
+
+pub fn generate_ed25519_seed() -> [u8; PAIRVERIFY_KEY_LENGTH] {
+    let mut seed = [0u8; PAIRVERIFY_KEY_LENGTH];
+    OsRng.fill_bytes(&mut seed);
+    seed
+}
+
+pub fn ed25519_public_key_from_seed(
+    seed: &[u8],
+) -> Result<[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH], PairVerifyError> {
+    let seed = array_32(TLV_IDENTIFIER, seed)?;
+    Ok(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
 }
 
 pub fn parse_pairverify_tlv(data: &[u8]) -> Result<PairVerifyFields, PairVerifyError> {

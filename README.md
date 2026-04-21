@@ -18,7 +18,8 @@ live under `research/` as reverse-engineering scaffolding.
   - PairVerify constants and client-side X25519/HKDF/ChaCha20-Poly1305/Ed25519 helpers
 - `crates/macolinux-ucd` has inspection subcommands plus experimental
   CompanionLink mDNS, Continuity BLE, TCP Rapport frame logging, and
-  PairSetup/PairVerify client probes.
+  PairSetup/PairVerify client probes. It can also generate and persist a Linux
+  Ed25519 peer identity for the future macOS trust-bootstrap flow.
 - `nix/module.nix` exposes a NixOS service module, but the service is still a
   research probe until macOS-side trust bootstrap, encrypted OPACK, and
   `uinput` are implemented.
@@ -30,7 +31,9 @@ cargo test
 cargo run -p macolinux-ucd -- --version
 cargo run -p macolinux-ucd -- tlv8 decode '0601010303616263'
 cargo run -p macolinux-ucd -- rapport dump '08000003010203'
-cargo run -p macolinux-ucd -- pairing resolve --addr endor.local:49427 --pairverify-client
+cargo run -p macolinux-ucd -- identity create --path ./fistel.identity.json --identifier fistel
+cargo run -p macolinux-ucd -- identity export-peer --path ./fistel.identity.json
+cargo run -p macolinux-ucd -- pairing resolve --addr endor.local:49427 --pairverify-client --identity ./fistel.identity.json
 cargo run -p macolinux-ucd -- serve --help
 ```
 

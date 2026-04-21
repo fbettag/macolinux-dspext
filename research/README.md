@@ -87,9 +87,14 @@ Decode or encode HomeKit/Continuity TLV8 blobs from PairVerify captures:
 Drive the current Rust PairVerify bootstrap probe:
 
 ```sh
+cargo run -p macolinux-ucd -- identity create \
+  --path ./fistel.identity.json \
+  --identifier fistel
+
 cargo run -p macolinux-ucd -- pairing resolve \
   --addr endor.local:49427 \
-  --pairverify-client
+  --pairverify-client \
+  --identity ./fistel.identity.json
 ```
 
 For PairSetup/PairVerify frames, Rapport expects an OPACK dictionary with the
@@ -98,9 +103,11 @@ not accepted on the wire.
 
 When the peer is already trusted, the same probe can decrypt PairVerify M2,
 verify the peer's Ed25519 signature if `--peer-ed25519-public-key-hex` is
-provided, and send M3 when supplied with a Linux identity via `--identity-id`
-and `--identity-ed25519-seed-hex`. The current clean bootstrap blocker is still
-creating a macOS-side trust record for that Linux identity.
+provided, and send M3 when supplied with a Linux identity via `--identity`.
+The older `--identity-id` and `--identity-ed25519-seed-hex` flags remain useful
+for one-off experiments, but the product path should use the persisted identity
+file. The current clean bootstrap blocker is still creating a macOS-side trust
+record for that Linux identity.
 
 Round-trip OPACK through the private macOS codec:
 
