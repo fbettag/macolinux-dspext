@@ -1,0 +1,11 @@
+[workspace]
+members = [
+  "crates/macolinux-uc-core",
+  "crates/macolinux-ucd",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/macolinux-dspext"

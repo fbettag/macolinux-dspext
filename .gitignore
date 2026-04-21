@@ -1,0 +1,21 @@
+/target/
+/result
+/result-*
+
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local reverse-engineering captures and Apple-derived artifacts.
+# Keep these out of the public repository.
+/research/analysis/
+*.pcap
+*.pcapng
+*.log
+*.dylib
+*.bin
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.xz
