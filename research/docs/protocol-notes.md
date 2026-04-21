@@ -848,6 +848,12 @@ Live TCP bootstrap status:
   with `_pd = 07 01 04 06 01 00`. Adding method `00 01 02` yields the same
   response. This means TCP framing, OPACK, `_pd`, and the M1 public-key TLV are
   now correct; the remaining failure is the trust/identity side of PairVerify.
+- The Rust probe now generates the PairVerify M1 X25519 keypair itself. For a
+  normal M2 it derives the HKDF-SHA512 `Pair-Verify-Encrypt` key, decrypts
+  `PV-Msg02`, optionally verifies the peer Ed25519 signature, and can build
+  encrypted M3 (`PV-Msg03`) from a supplied Linux identity. The live `endor`
+  listener currently returns the same error TLV before sending a server public
+  key, so the next blocker remains trust bootstrap rather than wire shape.
 
 Current inference: root access alone is not enough for a clean bootstrap,
 because macOS enforces this through code-signing entitlements and keychain

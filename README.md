@@ -15,13 +15,13 @@ live under `research/` as reverse-engineering scaffolding.
   - Rapport frame encode/decode
   - OPACK encode/decode for Rapport pre-auth and pairing probes
   - Bonjour `rpFl` to Rapport status flag mapping
-  - PairVerify constants recovered from CoreUtils
+  - PairVerify constants and client-side X25519/HKDF/ChaCha20-Poly1305/Ed25519 helpers
 - `crates/macolinux-ucd` has inspection subcommands plus experimental
   CompanionLink mDNS, Continuity BLE, TCP Rapport frame logging, and
-  PairSetup/PairVerify bootstrap probes.
+  PairSetup/PairVerify client probes.
 - `nix/module.nix` exposes a NixOS service module, but the service is still a
-  research probe until PairVerify, encrypted OPACK, and `uinput` are
-  implemented.
+  research probe until macOS-side trust bootstrap, encrypted OPACK, and
+  `uinput` are implemented.
 
 ## Development
 
@@ -30,7 +30,7 @@ cargo test
 cargo run -p macolinux-ucd -- --version
 cargo run -p macolinux-ucd -- tlv8 decode '0601010303616263'
 cargo run -p macolinux-ucd -- rapport dump '08000003010203'
-cargo run -p macolinux-ucd -- pairing resolve --addr endor.local:49427 --frame 0x05 --pairing-info-hex '0320...'
+cargo run -p macolinux-ucd -- pairing resolve --addr endor.local:49427 --pairverify-client
 cargo run -p macolinux-ucd -- serve --help
 ```
 

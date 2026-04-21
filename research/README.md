@@ -89,13 +89,18 @@ Drive the current Rust PairVerify bootstrap probe:
 ```sh
 cargo run -p macolinux-ucd -- pairing resolve \
   --addr endor.local:49427 \
-  --frame 0x05 \
-  --pairing-info-hex "0320<32-byte-x25519-public-key>"
+  --pairverify-client
 ```
 
 For PairSetup/PairVerify frames, Rapport expects an OPACK dictionary with the
 short key `_pd`; the value is TLV8 bytes. Long keys such as `pairingInfo` are
 not accepted on the wire.
+
+When the peer is already trusted, the same probe can decrypt PairVerify M2,
+verify the peer's Ed25519 signature if `--peer-ed25519-public-key-hex` is
+provided, and send M3 when supplied with a Linux identity via `--identity-id`
+and `--identity-ed25519-seed-hex`. The current clean bootstrap blocker is still
+creating a macOS-side trust record for that Linux identity.
 
 Round-trip OPACK through the private macOS codec:
 
