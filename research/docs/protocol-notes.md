@@ -785,6 +785,10 @@ Additional read-only probes on the current host:
   `rapportd` logs `Start pairing receiver controller`, then stops it when the
   process exits. Setting `pairingValueUIVisible` to true does not produce a
   `RPPairingPINInfo` without an incoming pairing initiator.
+- `RPRemoteDisplayServer startPairingServerWithCompletion:` can be called, but
+  activation fails with `kMissingEntitlementErr` for the private
+  `com.apple.RemoteDisplay` entitlement. No temporary Bonjour pairing service
+  was observed from an unsigned client during bounded tests.
 - Runtime protocol metadata shows the receiver XPC surface is intentionally
   small:
 
@@ -796,6 +800,21 @@ Rapport.RPPairingDaemonXPCInterface:
 Rapport.RPPairingReceiverControllerXPCClientInterface:
   pairingValueUpdated:
 ```
+
+Rapport's string table exposes the likely network pairing bootstrap:
+
+- request ID: `rppairing-bonjour-resolve`
+- temporary service types: `_applicationServicePairing._tcp` and
+  `_appSvcPrePair._tcp`
+- response object: `RPPairingBonjourResolveResponse`, containing
+  `serverPublicKey` and `bonjourServiceID`
+- follow-on stream label: `RPPairingPairVerifyStream`
+
+The current inference is that a Linux initiator must reproduce this
+CompanionLink pairing request path, then complete a PairVerify-style exchange
+against the temporary Bonjour service. Local macOS helper APIs are useful for
+introspection, but they do not avoid the entitlement problem for creating a real
+Universal Control trust record.
 
 Current inference: root access alone is not enough for a clean bootstrap,
 because macOS enforces this through code-signing entitlements and keychain

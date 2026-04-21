@@ -103,6 +103,7 @@ clang -fobjc-arc -framework Foundation -framework Security \
 /tmp/continuity-inspect pairing-summary
 /tmp/continuity-inspect auth-types 16
 /tmp/continuity-inspect rp-pairing-listen 10 visible
+/tmp/continuity-inspect rd-pairing-server 10
 ```
 
 Normal unsigned processes currently receive `kMissingEntitlementErr` from the
@@ -116,7 +117,9 @@ current test host, Sharing authentication type enumeration works, but actual
 candidate/eligible device listing is rejected by `sharingd` without the private
 authentication/unlock entitlement. Rapport's pairing receiver controller can be
 started by an ordinary process, but it does not emit a PIN by itself; it appears
-to wait for an incoming pairing initiator.
+to wait for an incoming pairing initiator. Remote Display pairing server
+activation is blocked without the private `com.apple.RemoteDisplay`
+entitlement, so that path cannot be used directly from a normal helper.
 
 Advertise a synthetic Apple Continuity BLE NearbyAction/NearbyInfo payload from
 a Linux BlueZ host:

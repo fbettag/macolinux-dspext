@@ -554,6 +554,111 @@ static void ProbeRPPairingListen(NSTimeInterval seconds, BOOL uiVisible) {
     printf("pairing events observed: %lu\n", (unsigned long)eventCount);
 }
 
+static void ProbeRemoteDisplayPairingServer(NSTimeInterval seconds) {
+    LoadContinuityFrameworks();
+
+    Class serverClass = NSClassFromString(@"RPRemoteDisplayServer");
+    if (!serverClass) {
+        fprintf(stderr, "RPRemoteDisplayServer not found\n");
+        return;
+    }
+
+    id server = [[serverClass alloc] init];
+    if (!server) {
+        fprintf(stderr, "failed to create RPRemoteDisplayServer\n");
+        return;
+    }
+
+    SEL setQueueSelector = @selector(setDispatchQueue:);
+    if ([server respondsToSelector:setQueueSelector]) {
+        typedef void (*SetQueueFn)(id, SEL, dispatch_queue_t);
+        SetQueueFn fn = (SetQueueFn)[server methodForSelector:setQueueSelector];
+        fn(server, setQueueSelector, dispatch_get_main_queue());
+    }
+
+    SEL setShowPasswordSelector = @selector(setShowPasswordHandler:);
+    if ([server respondsToSelector:setShowPasswordSelector]) {
+        id handler = ^(id password, unsigned int flags) {
+            printf("remote display show password: %s flags=0x%x\n",
+                   RedactedLength(password).UTF8String,
+                   flags);
+        };
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[server methodForSelector:setShowPasswordSelector];
+        fn(server, setShowPasswordSelector, [handler copy]);
+    }
+
+    SEL setHidePasswordSelector = @selector(setHidePasswordHandler:);
+    if ([server respondsToSelector:setHidePasswordSelector]) {
+        id handler = ^(void) {
+            puts("remote display hide password");
+        };
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[server methodForSelector:setHidePasswordSelector];
+        fn(server, setHidePasswordSelector, [handler copy]);
+    }
+
+    dispatch_semaphore_t activateSem = dispatch_semaphore_create(0);
+    SEL activateSelector = @selector(activateWithCompletion:);
+    if ([server respondsToSelector:activateSelector]) {
+        id completion = ^(NSError *error) {
+            if (error) {
+                printf("remote display activate error: %s\n", error.description.UTF8String);
+            } else {
+                puts("remote display activated");
+            }
+            dispatch_semaphore_signal(activateSem);
+        };
+        typedef void (*CompletionFn)(id, SEL, id);
+        CompletionFn fn = (CompletionFn)[server methodForSelector:activateSelector];
+        fn(server, activateSelector, [completion copy]);
+        if (!WaitForSemaphore(activateSem, 5.0)) {
+            puts("remote display activate timeout");
+        }
+    }
+
+    dispatch_semaphore_t startSem = dispatch_semaphore_create(0);
+    SEL startSelector = @selector(startPairingServerWithCompletion:);
+    if (![server respondsToSelector:startSelector]) {
+        puts("startPairingServerWithCompletion: unavailable");
+        return;
+    }
+    id startCompletion = ^(NSError *error) {
+        if (error) {
+            printf("remote display pairing server start error: %s\n", error.description.UTF8String);
+        } else {
+            puts("remote display pairing server started");
+        }
+        dispatch_semaphore_signal(startSem);
+    };
+    typedef void (*CompletionFn)(id, SEL, id);
+    CompletionFn start = (CompletionFn)[server methodForSelector:startSelector];
+    start(server, startSelector, [startCompletion copy]);
+    if (!WaitForSemaphore(startSem, 5.0)) {
+        puts("remote display pairing server start timeout");
+    }
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+
+    SEL stopSelector = @selector(stopPairingServer);
+    if ([server respondsToSelector:stopSelector]) {
+        typedef void (*VoidFn)(id, SEL);
+        VoidFn stop = (VoidFn)[server methodForSelector:stopSelector];
+        stop(server, stopSelector);
+        puts("remote display pairing server stopped");
+    }
+
+    SEL invalidateSelector = @selector(invalidate);
+    if ([server respondsToSelector:invalidateSelector]) {
+        typedef void (*VoidFn)(id, SEL);
+        VoidFn invalidate = (VoidFn)[server methodForSelector:invalidateSelector];
+        invalidate(server, invalidateSelector);
+    }
+}
+
 static void PrintPairingIdentityShape(id identity) {
     if (!identity) {
         puts("pairing identity: nil");
@@ -689,6 +794,7 @@ static void Usage(const char *argv0) {
     fprintf(stderr, "  %s keychain-summary\n", argv0);
     fprintf(stderr, "  %s auth-types [MAX_TYPE]\n", argv0);
     fprintf(stderr, "  %s rp-pairing-listen [SECONDS] [visible]\n", argv0);
+    fprintf(stderr, "  %s rd-pairing-server [SECONDS]\n", argv0);
     fprintf(stderr, "\n");
     fprintf(stderr, "This tool is read-only and redacts keychain/private-key values by default.\n");
 }
@@ -734,6 +840,14 @@ int main(int argc, const char *argv[]) {
                 seconds = 0.1;
             }
             ProbeRPPairingListen(seconds, uiVisible);
+            return 0;
+        }
+        if ([command isEqualToString:@"rd-pairing-server"]) {
+            NSTimeInterval seconds = argc >= 3 ? strtod(argv[2], NULL) : 10.0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            ProbeRemoteDisplayPairingServer(seconds);
             return 0;
         }
 
