@@ -140,10 +140,11 @@ fn run_btmgmt(
         .arg("--index")
         .arg(index)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
+    let _stdin_guard = child.stdin.take();
 
     let started = Instant::now();
     let status = loop {
