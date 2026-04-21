@@ -113,6 +113,7 @@ fn bind_mdns_socket(interface: Ipv4Addr) -> Result<UdpSocket, Box<dyn Error>> {
         MDNS_PORT,
     )))?;
     socket.join_multicast_v4(&MDNS_ADDR, &interface)?;
+    socket.set_multicast_if_v4(&interface)?;
     socket.set_multicast_loop_v4(true)?;
     socket.set_multicast_ttl_v4(255)?;
     Ok(socket.into())
