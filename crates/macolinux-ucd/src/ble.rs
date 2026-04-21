@@ -1,14 +1,15 @@
 use std::error::Error;
 use std::fmt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const APPLE_COMPANY_ID_LE: [u8; 2] = [0x4c, 0x00];
 const AD_TYPE_FLAGS: u8 = 0x01;
 const AD_TYPE_MANUFACTURER: u8 = 0xff;
 const CONTINUITY_NEARBY_ACTION: u8 = 0x0f;
 const CONTINUITY_NEARBY_INFO: u8 = 0x10;
+const BTMGMT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct BleConfig {
@@ -114,15 +115,11 @@ impl BleConfig {
     }
 
     fn apply_advertisement(&self, adv_hex: &str) -> Result<(), Box<dyn Error>> {
-        run_btmgmt(&self.btmgmt_path, &self.index, &["power", "off"], false)?;
-        run_btmgmt(&self.btmgmt_path, &self.index, &["le", "on"], false)?;
-        run_btmgmt(&self.btmgmt_path, &self.index, &["bredr", "off"], false)?;
-        run_btmgmt(
-            &self.btmgmt_path,
-            &self.index,
-            &["connectable", "on"],
-            false,
-        )?;
+        run_btmgmt(&self.btmgmt_path, &self.index, &["info"], true)?;
+        run_btmgmt(&self.btmgmt_path, &self.index, &["power", "off"], true)?;
+        run_btmgmt(&self.btmgmt_path, &self.index, &["le", "on"], true)?;
+        run_btmgmt(&self.btmgmt_path, &self.index, &["bredr", "off"], true)?;
+        run_btmgmt(&self.btmgmt_path, &self.index, &["connectable", "on"], true)?;
         run_btmgmt(&self.btmgmt_path, &self.index, &["power", "on"], false)?;
         run_btmgmt(&self.btmgmt_path, &self.index, &["clr-adv"], true)?;
 
@@ -146,24 +143,47 @@ fn run_btmgmt(
     args: &[&str],
     allow_failure: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let output = Command::new(btmgmt_path)
+    println!("running btmgmt --index {index} {}", args.join(" "));
+    let mut child = Command::new(btmgmt_path)
         .arg("--index")
         .arg(index)
         .args(args)
-        .output()?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
 
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= BTMGMT_COMMAND_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            if allow_failure {
+                eprintln!(
+                    "btmgmt {} timed out after {}s",
+                    args.join(" "),
+                    BTMGMT_COMMAND_TIMEOUT.as_secs()
+                );
+                return Ok(());
+            }
+            return Err(BleError(format!(
+                "btmgmt {} timed out after {}s",
+                args.join(" "),
+                BTMGMT_COMMAND_TIMEOUT.as_secs()
+            ))
+            .into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
 
-    if !output.status.success() && !allow_failure {
+    if !status.success() && !allow_failure {
         return Err(BleError(format!(
             "btmgmt {} failed with status {}",
             args.join(" "),
-            output.status
+            status
         ))
         .into());
     }
