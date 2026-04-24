@@ -54,6 +54,14 @@ let
     ++ optionalArg "--ipv4" cfg.ipv4
     ++ optionalArg "--multicast-ipv4" cfg.multicastIpv4
     ++ optionalArg "--ble-address" cfg.bleAddress
+    ++ optionalArg "--identity" cfg.identityPath
+    ++ lib.concatMap (peer: [
+      "--trusted-peer"
+      peer
+    ]) cfg.trustedPeers
+    ++ lib.optionals cfg.allowUnknownPeer [ "--allow-unknown-peer" ]
+    ++ optionalArg "--stream-bind" cfg.streamBind
+    ++ optionalArg "--stream-advertise-addr" cfg.streamAdvertiseAddr
     ++ lib.concatMap (txt: [
       "--txt"
       txt
@@ -121,6 +129,40 @@ in
       default = null;
       example = "02:00:00:00:00:31";
       description = "Bluetooth address to publish as CompanionLink rpBA.";
+    };
+
+    identityPath = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/var/lib/macolinux-uc/identity.json";
+      description = "Path to the Linux PairVerify identity JSON used by the Rapport server.";
+    };
+
+    trustedPeers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "/var/lib/macolinux-uc/controller-peer.json" ];
+      description = "Exported public peer identity JSON files allowed to complete PairVerify.";
+    };
+
+    allowUnknownPeer = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Allow PairVerify clients that are not present in trustedPeers. Experimental and unsafe.";
+    };
+
+    streamBind = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "0.0.0.0:0";
+      description = "Bind address for inbound Universal Control stream listeners prepared after PairVerify.";
+    };
+
+    streamAdvertiseAddr = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "192.0.2.11";
+      description = "Address returned in `_streamStart` responses. Defaults to the configured ipv4.";
     };
 
     txt = lib.mkOption {
@@ -203,6 +245,15 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion =
+          cfg.identityPath != null
+          || (cfg.trustedPeers == [ ] && cfg.allowUnknownPeer == false);
+        message = "services.macolinux-uc.identityPath must be set when trustedPeers or allowUnknownPeer is enabled.";
+      }
+    ];
+
     environment.systemPackages = [ cfg.package ] ++ lib.optionals cfg.ble.enable [ cfg.ble.bluezPackage ];
     hardware.bluetooth.enable = lib.mkDefault cfg.ble.enable;
 

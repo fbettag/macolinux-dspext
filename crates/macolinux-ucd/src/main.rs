@@ -3,6 +3,9 @@ use std::error::Error;
 use std::fmt;
 use std::process;
 
+use macolinux_uc_core::opack::OpackValue;
+use macolinux_uc_core::pairing_stream::{PairingStream, PairingStreamEndpoint};
+use macolinux_uc_core::pairverify::PAIRVERIFY_KEY_LENGTH;
 use macolinux_uc_core::rapport::{decode_many, RapportFrame};
 use macolinux_uc_core::tlv8::{decode_tlv8, encode_tlv8};
 
@@ -11,6 +14,7 @@ mod identity;
 mod mdns;
 mod pairing;
 mod serve;
+mod stream_server;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -29,14 +33,105 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         Some("tlv8") => run_tlv8(&args[2..]),
         Some("rapport") => run_rapport(&args[2..]),
+        Some("eopack") => run_eopack(&args[2..]),
         Some("identity") => identity::run(&args[2..]),
         Some("pairing") => pairing::run(&args[2..]),
         Some("serve") => serve::run(&args[2..]),
+        Some("stream") => stream_server::run(&args[2..]),
         Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())
         }
         Some(other) => Err(CliError(format!("unknown command: {other}")).into()),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EopackDecryptConfig {
+    psk: [u8; PAIRVERIFY_KEY_LENGTH],
+    endpoint: PairingStreamEndpoint,
+    stream_name: String,
+    input: EopackInput,
+}
+
+#[derive(Debug, Clone)]
+enum EopackInput {
+    Frames(Vec<u8>),
+    Body(Vec<u8>),
+}
+
+fn run_eopack(args: &[String]) -> Result<(), Box<dyn Error>> {
+    match args.first().map(String::as_str) {
+        Some("decrypt") => {
+            let config = EopackDecryptConfig::parse(&args[1..])?;
+            let mut stream = PairingStream::new(&config.stream_name, config.endpoint, &config.psk)?;
+            let frames = match config.input {
+                EopackInput::Frames(data) => decode_many(&data)?,
+                EopackInput::Body(body) => vec![RapportFrame {
+                    frame_type: macolinux_uc_core::rapport::FRAME_TYPE_E_OPACK,
+                    body,
+                }],
+            };
+
+            for (index, frame) in frames.iter().enumerate() {
+                println!(
+                    "#{index} type=0x{:02x} name={} body_len={}",
+                    frame.frame_type,
+                    frame.name(),
+                    frame.body.len()
+                );
+                match stream.decrypt_e_opack_frame(frame) {
+                    Ok(value) => {
+                        println!("#{index} opack={}", format_opack(&value));
+                        println!("#{index} decrypt_nonce={}", to_hex(&stream.decrypt_nonce()));
+                    }
+                    Err(err) => println!("#{index} decrypt_error={err}"),
+                }
+            }
+            Ok(())
+        }
+        Some("-h") | Some("--help") | None => {
+            println!("{}", eopack_usage());
+            Ok(())
+        }
+        Some(other) => Err(CliError(format!("unknown eopack command: {other}")).into()),
+    }
+}
+
+impl EopackDecryptConfig {
+    fn parse(args: &[String]) -> Result<Self, Box<dyn Error>> {
+        let mut psk = None;
+        let mut endpoint = PairingStreamEndpoint::Client;
+        let mut stream_name = "main".to_string();
+        let mut input = None;
+
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--psk-hex" => psk = Some(parse_fixed_32(&next_value(&mut iter, arg)?, "PSK")?),
+                "--endpoint" => endpoint = parse_endpoint(&next_value(&mut iter, arg)?)?,
+                "--stream-name" => stream_name = next_value(&mut iter, arg)?,
+                "--frame-hex" => {
+                    input = Some(EopackInput::Frames(parse_hex(&next_value(
+                        &mut iter, arg,
+                    )?)?))
+                }
+                "--body-hex" => {
+                    input = Some(EopackInput::Body(parse_hex(&next_value(&mut iter, arg)?)?))
+                }
+                "-h" | "--help" => return Err(CliError(eopack_usage()).into()),
+                other => {
+                    return Err(CliError(format!("unknown eopack decrypt option: {other}")).into())
+                }
+            }
+        }
+
+        Ok(Self {
+            psk: psk.ok_or_else(|| CliError("missing --psk-hex".into()))?,
+            endpoint,
+            stream_name,
+            input: input.ok_or_else(|| CliError("missing --frame-hex or --body-hex".into()))?,
+        })
     }
 }
 
@@ -130,13 +225,21 @@ Usage:
   macolinux-ucd tlv8 encode TYPE=HEX ...
   macolinux-ucd rapport dump HEX
   macolinux-ucd rapport encode FRAME_TYPE [BODY_HEX]
+  macolinux-ucd eopack decrypt --psk-hex HEX (--frame-hex HEX | --body-hex HEX)
   macolinux-ucd identity create [--path PATH] [--identifier TEXT] [--force]
   macolinux-ucd identity show [--path PATH] [--show-secret]
   macolinux-ucd identity export-peer [--path PATH]
   macolinux-ucd pairing resolve --addr HOST:PORT [--frame 0x07] [--shape companion-empty-request]
+  macolinux-ucd stream prepare --request-opack-hex HEX [--bind ADDR:PORT]
+                              [--advertise-addr ADDR] [--accept-timeout-ms MS]
   macolinux-ucd serve [--instance NAME] [--hostname NAME.local] [--port PORT]
                      [--ipv4 ADDR] [--multicast-ipv4 ADDR]
-                     [--ble-address MAC] [--txt KEY=VALUE] [--ble-enable]
+                     [--ble-address MAC] [--txt KEY=VALUE]
+                     [--identity PATH] [--trusted-peer PATH]...
+                     [--allow-unknown-peer]
+                     [--stream-bind ADDR:PORT]
+                     [--stream-advertise-addr ADDR]
+                     [--ble-enable]
 "
     );
 }
@@ -169,6 +272,15 @@ fn parse_typed_hex(value: &str) -> Result<(u8, Vec<u8>), Box<dyn Error>> {
     Ok((parse_u8(kind)?, parse_hex(hex)?))
 }
 
+fn next_value<'a>(
+    iter: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> Result<String, CliError> {
+    iter.next()
+        .cloned()
+        .ok_or_else(|| CliError(format!("missing value for {flag}")))
+}
+
 fn parse_u8(value: &str) -> Result<u8, Box<dyn Error>> {
     let text = value.trim();
     let parsed = if let Some(hex) = text.strip_prefix("0x") {
@@ -179,14 +291,21 @@ fn parse_u8(value: &str) -> Result<u8, Box<dyn Error>> {
     Ok(parsed)
 }
 
+fn parse_endpoint(value: &str) -> Result<PairingStreamEndpoint, CliError> {
+    match value {
+        "client" => Ok(PairingStreamEndpoint::Client),
+        "server" => Ok(PairingStreamEndpoint::Server),
+        other => Err(CliError(format!("invalid endpoint {other:?}"))),
+    }
+}
+
 fn parse_hex(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut cleaned = value
         .trim()
         .strip_prefix("0x")
         .unwrap_or(value.trim())
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
+        .to_string();
+    cleaned.retain(|ch| !ch.is_whitespace() && ch != ':' && ch != '-');
     cleaned.make_ascii_lowercase();
 
     if cleaned.len() % 2 != 0 {
@@ -201,8 +320,49 @@ fn parse_hex(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(out)
 }
 
+fn parse_fixed_32(value: &str, label: &str) -> Result<[u8; PAIRVERIFY_KEY_LENGTH], Box<dyn Error>> {
+    let bytes = parse_hex(value)?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        CliError(format!("{label} must be 32 bytes, got {}", bytes.len())).into()
+    })
+}
+
 fn to_hex(data: &[u8]) -> String {
     data.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn format_opack(value: &OpackValue) -> String {
+    match value {
+        OpackValue::Null => "null".into(),
+        OpackValue::Bool(value) => value.to_string(),
+        OpackValue::Int(value) => value.to_string(),
+        OpackValue::String(value) => format!("{value:?}"),
+        OpackValue::Data(value) => format!("<data:{}:{}>", value.len(), to_hex(value)),
+        OpackValue::Array(values) => {
+            let inner = values
+                .iter()
+                .map(format_opack)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{inner}]")
+        }
+        OpackValue::Dict(values) => {
+            let inner = values
+                .iter()
+                .map(|(key, value)| format!("{key:?}: {}", format_opack(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{inner}}}")
+        }
+    }
+}
+
+fn eopack_usage() -> String {
+    "usage:
+  macolinux-ucd eopack decrypt --psk-hex HEX [--endpoint client|server]
+                              [--stream-name NAME]
+                              (--frame-hex HEX | --body-hex HEX)"
+        .into()
 }
 
 #[derive(Debug)]

@@ -7,11 +7,16 @@ use std::time::Duration;
 
 use crate::identity::LinuxIdentity;
 use macolinux_uc_core::opack::{decode_opack, dict, empty_dict, encode_opack, OpackValue};
+use macolinux_uc_core::pairing_stream::{PairingStream, PairingStreamEndpoint};
+use macolinux_uc_core::pairsetup::{
+    build_pairsetup_m1, build_pairsetup_m3_tlv, compute_pairsetup_m3, parse_pairsetup_tlv,
+    PairSetupFields,
+};
 use macolinux_uc_core::pairverify::{
     build_pairverify_m1, build_pairverify_m3, build_pairverify_m3_plaintext, derive_pairverify_key,
     parse_pairverify_m2, verify_pairverify_m2_signature, PairVerifyFields, PairVerifyKeyPair,
 };
-use macolinux_uc_core::rapport::{frame_type_name, RapportFrame};
+use macolinux_uc_core::rapport::{frame_type_name, RapportFrame, FRAME_TYPE_E_OPACK};
 
 const REQUEST_ID: &str = "rppairing-bonjour-resolve";
 
@@ -25,11 +30,20 @@ struct ResolveConfig {
     data_key: String,
     pairing_info: Option<Vec<u8>>,
     opack_data: Option<Vec<u8>>,
+    pairsetup_client: bool,
+    pairsetup_method: u8,
+    pairsetup_password_type: Option<i64>,
+    pairsetup_auth_type: Option<i64>,
+    pairsetup_username: Vec<u8>,
+    pairsetup_password: Option<Vec<u8>>,
     pairverify_client: bool,
     identity_path: Option<PathBuf>,
     identity_id: Option<Vec<u8>>,
     identity_seed: Option<Vec<u8>>,
     peer_signing_key: Option<Vec<u8>>,
+    eopack_after_pairverify: bool,
+    show_pairverify_psk: bool,
+    eopack_psk_source: EopackPskSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +51,12 @@ enum RequestShape {
     RequestIdOnly,
     CompanionRequest,
     CompanionRequestWithEmptyRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EopackPskSource {
+    RawSharedSecret,
+    PairVerifyEncryptKey,
 }
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -92,6 +112,8 @@ fn run_resolve(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     if let Some(key_pair) = pairverify_key_pair {
         read_pairverify_frames(&mut stream, &config, &key_pair)
+    } else if config.pairsetup_client {
+        read_pairsetup_frames(&mut stream, &config)
     } else {
         read_frames(&mut stream)
     }
@@ -108,11 +130,20 @@ impl ResolveConfig {
             data_key: "_pd".into(),
             pairing_info: None,
             opack_data: None,
+            pairsetup_client: false,
+            pairsetup_method: 0,
+            pairsetup_password_type: None,
+            pairsetup_auth_type: None,
+            pairsetup_username: b"Pair-Setup".to_vec(),
+            pairsetup_password: None,
             pairverify_client: false,
             identity_path: None,
             identity_id: None,
             identity_seed: None,
             peer_signing_key: None,
+            eopack_after_pairverify: true,
+            show_pairverify_psk: false,
+            eopack_psk_source: EopackPskSource::RawSharedSecret,
         };
 
         let mut iter = args.iter();
@@ -143,6 +174,28 @@ impl ResolveConfig {
                     let value = next_value(&mut iter, arg)?;
                     config.opack_data = Some(parse_hex(&value)?);
                 }
+                "--pairsetup-client" => {
+                    config.pairsetup_client = true;
+                    config.frame_type = 0x03;
+                }
+                "--pairsetup-method" => {
+                    let value = next_value(&mut iter, arg)?;
+                    config.pairsetup_method = parse_u8(&value)?;
+                }
+                "--pairsetup-password-type" => {
+                    let value = next_value(&mut iter, arg)?;
+                    config.pairsetup_password_type = Some(parse_i64(&value)?);
+                }
+                "--pairsetup-auth-type" => {
+                    let value = next_value(&mut iter, arg)?;
+                    config.pairsetup_auth_type = Some(parse_i64(&value)?);
+                }
+                "--pairsetup-username" => {
+                    config.pairsetup_username = next_value(&mut iter, arg)?.into_bytes();
+                }
+                "--pairsetup-password" => {
+                    config.pairsetup_password = Some(next_value(&mut iter, arg)?.into_bytes());
+                }
                 "--pairverify-client" => {
                     config.pairverify_client = true;
                     config.frame_type = 0x05;
@@ -163,10 +216,22 @@ impl ResolveConfig {
                     let value = next_value(&mut iter, arg)?;
                     config.peer_signing_key = Some(parse_hex(&value)?);
                 }
+                "--no-eopack-after-pairverify" => config.eopack_after_pairverify = false,
+                "--show-pairverify-psk" => config.show_pairverify_psk = true,
+                "--eopack-psk" => {
+                    let value = next_value(&mut iter, arg)?;
+                    config.eopack_psk_source = EopackPskSource::parse(&value)?;
+                }
                 "--no-preauth" => config.preauth = false,
                 "-h" | "--help" => return Err(PairingError(usage())),
                 other => return Err(PairingError(format!("unknown resolve option: {other}"))),
             }
+        }
+
+        if config.pairsetup_client && config.pairverify_client {
+            return Err(PairingError(
+                "--pairsetup-client and --pairverify-client are mutually exclusive".into(),
+            ));
         }
 
         Ok(config)
@@ -197,6 +262,20 @@ impl ResolveConfig {
     }
 
     fn opack_value(&self, pairverify_key_pair: Option<&PairVerifyKeyPair>) -> OpackValue {
+        if self.pairsetup_client {
+            let mut entries = vec![(
+                self.data_key.as_str(),
+                OpackValue::Data(build_pairsetup_m1(self.pairsetup_method)),
+            )];
+            if let Some(password_type) = self.pairsetup_password_type {
+                entries.push(("_pwTy", OpackValue::Int(password_type)));
+            }
+            if let Some(auth_type) = self.pairsetup_auth_type {
+                entries.push(("_auTy", OpackValue::Int(auth_type)));
+            }
+            return dict(entries);
+        }
+
         if let Some(key_pair) = pairverify_key_pair {
             return dict([(
                 self.data_key.as_str(),
@@ -253,6 +332,23 @@ impl RequestShape {
     }
 }
 
+impl EopackPskSource {
+    fn parse(value: &str) -> Result<Self, PairingError> {
+        match value {
+            "raw-shared-secret" => Ok(Self::RawSharedSecret),
+            "pairverify-key" => Ok(Self::PairVerifyEncryptKey),
+            other => Err(PairingError(format!("unknown E_OPACK PSK source: {other}"))),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RawSharedSecret => "raw-shared-secret",
+            Self::PairVerifyEncryptKey => "pairverify-key",
+        }
+    }
+}
+
 fn send_frame(stream: &mut TcpStream, frame_type: u8, body: Vec<u8>) -> Result<(), Box<dyn Error>> {
     let frame = RapportFrame { frame_type, body }.encode()?;
     stream.write_all(&frame)?;
@@ -304,6 +400,127 @@ fn read_frames(stream: &mut TcpStream) -> Result<(), Box<dyn Error>> {
             Ok(value) => println!("response #{count} opack={}", format_opack(&value)),
             Err(err) => println!("response #{count} opack_decode_error={err}"),
         }
+        count += 1;
+    }
+}
+
+fn read_pairsetup_frames(
+    stream: &mut TcpStream,
+    config: &ResolveConfig,
+) -> Result<(), Box<dyn Error>> {
+    let Some((frame_type, body)) = read_one_frame(stream)? else {
+        println!("no PairSetup response before timeout");
+        return Ok(());
+    };
+
+    println!(
+        "pairsetup response: type=0x{frame_type:02x} name={} body_len={} body_hex={}",
+        frame_type_name(frame_type),
+        body.len(),
+        to_hex(&body)
+    );
+
+    let value = decode_opack(&body)?;
+    println!("pairsetup response opack={}", format_opack(&value));
+
+    let Some(pairing_data) = opack_dict_data(&value, &config.data_key) else {
+        println!(
+            "pairsetup response missing OPACK data key {:?}",
+            config.data_key
+        );
+        return read_frames(stream);
+    };
+    println!(
+        "pairsetup response {}={}",
+        config.data_key,
+        to_hex(&pairing_data)
+    );
+
+    let parsed = parse_pairsetup_tlv(&pairing_data)?;
+    print_pairsetup_fields("pairsetup", &parsed);
+
+    if parsed.error.is_some() {
+        println!("pairsetup stopped on server error TLV");
+        return Ok(());
+    }
+
+    let Some(password) = config.pairsetup_password.as_deref() else {
+        println!("pairsetup M2 parsed, but no --pairsetup-password was provided for M3");
+        return read_frames(stream);
+    };
+    let Some(salt) = parsed.salt.as_deref() else {
+        println!("pairsetup response has no SRP salt");
+        return Ok(());
+    };
+    let Some(server_public_key) = parsed.public_key.as_deref() else {
+        println!("pairsetup response has no SRP server public key");
+        return Ok(());
+    };
+
+    let m3 = compute_pairsetup_m3(
+        &config.pairsetup_username,
+        password,
+        salt,
+        server_public_key,
+    )?;
+    let m3_tlv = build_pairsetup_m3_tlv(&m3.public_key, &m3.proof);
+    println!("pairsetup m3_public_key={}", to_hex(&m3.public_key));
+    println!("pairsetup m3_proof={}", to_hex(&m3.proof));
+    println!("pairsetup m3_premaster_key_len={}", m3.premaster_key.len());
+    println!("pairsetup m3_tlv={}", to_hex(&m3_tlv));
+    let body = encode_opack(&dict([(
+        config.data_key.as_str(),
+        OpackValue::Data(m3_tlv),
+    )]))?;
+    send_frame(stream, 0x04, body)?;
+
+    read_pairsetup_followup_frames(stream, config)
+}
+
+fn read_pairsetup_followup_frames(
+    stream: &mut TcpStream,
+    config: &ResolveConfig,
+) -> Result<(), Box<dyn Error>> {
+    let mut count = 0usize;
+    loop {
+        let Some((frame_type, body)) = read_one_frame(stream)? else {
+            if count == 0 {
+                println!("no PairSetup follow-up response before timeout");
+            } else {
+                println!("PairSetup follow-up timeout after {count} frame(s)");
+            }
+            return Ok(());
+        };
+
+        println!(
+            "pairsetup follow-up #{count}: type=0x{:02x} name={} body_len={} body_hex={}",
+            frame_type,
+            frame_type_name(frame_type),
+            body.len(),
+            to_hex(&body)
+        );
+
+        match decode_opack(&body) {
+            Ok(value) => {
+                println!(
+                    "pairsetup follow-up #{count} opack={}",
+                    format_opack(&value)
+                );
+                if let Some(pairing_data) = opack_dict_data(&value, &config.data_key) {
+                    println!(
+                        "pairsetup follow-up #{count} {}={}",
+                        config.data_key,
+                        to_hex(&pairing_data)
+                    );
+                    match parse_pairsetup_tlv(&pairing_data) {
+                        Ok(fields) => print_pairsetup_fields("pairsetup follow-up parsed", &fields),
+                        Err(err) => println!("pairsetup follow-up parse error={err}"),
+                    }
+                }
+            }
+            Err(err) => println!("pairsetup follow-up #{count} opack_decode_error={err}"),
+        }
+
         count += 1;
     }
 }
@@ -391,6 +608,10 @@ fn read_pairverify_frames(
 
     let shared_secret = key_pair.shared_secret(&server_public_key)?;
     let encryption_key = derive_pairverify_key(&shared_secret)?;
+    if config.show_pairverify_psk {
+        println!("pairverify_shared_secret={}", to_hex(&shared_secret));
+        println!("pairverify_encryption_key={}", to_hex(&encryption_key));
+    }
     let plaintext = build_pairverify_m3_plaintext(
         &key_pair.public_key(),
         identity_id,
@@ -402,7 +623,70 @@ fn read_pairverify_frames(
     println!("pairverify m3_tlv={}", to_hex(&m3));
     let body = encode_opack(&dict([(config.data_key.as_str(), OpackValue::Data(m3))]))?;
     send_frame(stream, 0x06, body)?;
-    read_frames(stream)
+
+    if config.eopack_after_pairverify {
+        let eopack_psk = match config.eopack_psk_source {
+            EopackPskSource::RawSharedSecret => shared_secret,
+            EopackPskSource::PairVerifyEncryptKey => encryption_key,
+        };
+        println!(
+            "encrypted follow-up psk_source={}",
+            config.eopack_psk_source.label()
+        );
+        let mut pairing_stream = PairingStream::main(PairingStreamEndpoint::Client, &eopack_psk)?;
+        read_encrypted_frames(stream, &mut pairing_stream)
+    } else {
+        read_frames(stream)
+    }
+}
+
+fn read_encrypted_frames(
+    stream: &mut TcpStream,
+    pairing_stream: &mut PairingStream,
+) -> Result<(), Box<dyn Error>> {
+    let mut count = 0usize;
+    loop {
+        let Some((frame_type, body)) = read_one_frame(stream)? else {
+            if count == 0 {
+                println!("no encrypted follow-up response before timeout");
+            } else {
+                println!("encrypted follow-up timeout after {count} frame(s)");
+            }
+            return Ok(());
+        };
+
+        println!(
+            "encrypted response #{count}: type=0x{:02x} name={} body_len={} body_hex={}",
+            frame_type,
+            frame_type_name(frame_type),
+            body.len(),
+            to_hex(&body)
+        );
+
+        if frame_type == FRAME_TYPE_E_OPACK {
+            let frame = RapportFrame { frame_type, body };
+            match pairing_stream.decrypt_e_opack_frame(&frame) {
+                Ok(value) => {
+                    println!(
+                        "encrypted response #{count} decrypted_opack={}",
+                        format_opack(&value)
+                    );
+                    println!(
+                        "encrypted response #{count} decrypt_nonce={}",
+                        to_hex(&pairing_stream.decrypt_nonce())
+                    );
+                }
+                Err(err) => println!("encrypted response #{count} decrypt_error={err}"),
+            }
+        } else {
+            match decode_opack(&body) {
+                Ok(value) => println!("encrypted response #{count} opack={}", format_opack(&value)),
+                Err(err) => println!("encrypted response #{count} opack_decode_error={err}"),
+            }
+        }
+
+        count += 1;
+    }
 }
 
 fn read_one_frame(stream: &mut TcpStream) -> Result<Option<(u8, Vec<u8>)>, Box<dyn Error>> {
@@ -465,6 +749,47 @@ fn print_pairverify_fields(label: &str, fields: &PairVerifyFields) {
     }
 }
 
+fn print_pairsetup_fields(label: &str, fields: &PairSetupFields) {
+    println!("{label}:");
+    print_optional_u64("method", fields.method);
+    print_optional_u64("state", fields.state);
+    print_optional_u64("error", fields.error);
+    print_optional_u64("retry_delay", fields.retry_delay);
+    if let Some(identifier) = &fields.identifier {
+        println!("  identifier={}", String::from_utf8_lossy(identifier));
+        println!("  identifier_hex={}", to_hex(identifier));
+    }
+    if let Some(salt) = &fields.salt {
+        println!("  salt_len={} salt={}", salt.len(), to_hex(salt));
+    }
+    if let Some(public_key) = &fields.public_key {
+        println!(
+            "  public_key_len={} public_key={}",
+            public_key.len(),
+            to_hex(public_key)
+        );
+    }
+    if let Some(proof) = &fields.proof {
+        println!("  proof_len={} proof={}", proof.len(), to_hex(proof));
+    }
+    if let Some(encrypted_data) = &fields.encrypted_data {
+        println!(
+            "  encrypted_data_len={} encrypted_data={}",
+            encrypted_data.len(),
+            to_hex(encrypted_data)
+        );
+    }
+    for entry in &fields.unknown {
+        println!(
+            "  tlv_0x{:02x}_len={} tlv_0x{:02x}={}",
+            entry.kind,
+            entry.value.len(),
+            entry.kind,
+            to_hex(&entry.value)
+        );
+    }
+}
+
 fn print_optional_u64(label: &str, value: Option<u64>) {
     if let Some(value) = value {
         println!("  {label}={value} 0x{value:x}");
@@ -493,6 +818,16 @@ fn parse_u8(value: &str) -> Result<u8, PairingError> {
         value.parse::<u8>()
     }
     .map_err(|err| PairingError(format!("invalid u8 {value:?}: {err}")))?;
+    Ok(parsed)
+}
+
+fn parse_i64(value: &str) -> Result<i64, PairingError> {
+    let parsed = if let Some(hex) = value.strip_prefix("0x") {
+        i64::from_str_radix(hex, 16)
+    } else {
+        value.parse::<i64>()
+    }
+    .map_err(|err| PairingError(format!("invalid i64 {value:?}: {err}")))?;
     Ok(parsed)
 }
 
@@ -555,6 +890,11 @@ fn usage() -> String {
   macolinux-ucd pairing resolve --addr HOST:PORT [--timeout-ms MS]
                               [--frame 0x03|0x05|0x07|0x09]
                               [--shape request-id-only|companion|companion-empty-request]
+                              [--pairsetup-client] [--pairsetup-method U8]
+                              [--pairsetup-password-type I64]
+                              [--pairsetup-auth-type I64]
+                              [--pairsetup-username TEXT]
+                              [--pairsetup-password TEXT]
                               [--pairverify-client]
                               [--pairing-info-hex TLV8_HEX] [--data-key KEY]
                               [--opack-data-hex HEX]
@@ -562,6 +902,9 @@ fn usage() -> String {
                               [--identity-id TEXT|--identity-id-hex HEX]
                               [--identity-ed25519-seed-hex HEX]
                               [--peer-ed25519-public-key-hex HEX]
+                              [--no-eopack-after-pairverify]
+                              [--eopack-psk raw-shared-secret|pairverify-key]
+                              [--show-pairverify-psk]
                               [--no-preauth]"
         .into()
 }

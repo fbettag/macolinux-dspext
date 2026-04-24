@@ -20,6 +20,8 @@ pub const TLV_ERROR: u8 = 0x07;
 pub const TLV_SIGNATURE: u8 = 0x0a;
 pub const TLV_APP_FLAGS: u8 = 0x19;
 
+pub const PAIR_VERIFY_ERROR_AUTHENTICATION: u8 = 0x04;
+
 pub const PAIR_VERIFY_ECDH_SALT: &[u8] = b"Pair-Verify-ECDH-Salt";
 pub const PAIR_VERIFY_ECDH_INFO: &[u8] = b"Pair-Verify-ECDH-Info";
 pub const PAIR_VERIFY_ENCRYPT_SALT: &[u8] = b"Pair-Verify-Encrypt-Salt";
@@ -118,6 +120,16 @@ impl PairVerifyKeyPair {
         Self { secret, public_key }
     }
 
+    pub fn from_secret_bytes(secret: [u8; PAIRVERIFY_KEY_LENGTH]) -> Self {
+        let secret = StaticSecret::from(secret);
+        let public_key = PublicKey::from(&secret).to_bytes();
+        Self { secret, public_key }
+    }
+
+    pub fn secret_bytes(&self) -> [u8; PAIRVERIFY_KEY_LENGTH] {
+        self.secret.to_bytes()
+    }
+
     pub fn public_key(&self) -> [u8; PAIRVERIFY_PUBLIC_KEY_LENGTH] {
         self.public_key
     }
@@ -212,11 +224,25 @@ pub fn decrypt_pairverify_m2(
     decrypt_pairverify_data(key, PAIR_VERIFY_M2_NONCE, encrypted_data)
 }
 
+pub fn encrypt_pairverify_m2(
+    key: &[u8; PAIRVERIFY_KEY_LENGTH],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, PairVerifyError> {
+    encrypt_pairverify_data(key, PAIR_VERIFY_M2_NONCE, plaintext)
+}
+
 pub fn encrypt_pairverify_m3(
     key: &[u8; PAIRVERIFY_KEY_LENGTH],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, PairVerifyError> {
     encrypt_pairverify_data(key, PAIR_VERIFY_M3_NONCE, plaintext)
+}
+
+pub fn decrypt_pairverify_m3(
+    key: &[u8; PAIRVERIFY_KEY_LENGTH],
+    encrypted_data: &[u8],
+) -> Result<Vec<u8>, PairVerifyError> {
+    decrypt_pairverify_data(key, PAIR_VERIFY_M3_NONCE, encrypted_data)
 }
 
 pub fn parse_pairverify_m2(
@@ -239,25 +265,66 @@ pub fn parse_pairverify_m2(
     })
 }
 
+pub fn build_pairverify_m2_plaintext(
+    server_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    server_identifier: &[u8],
+    client_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    server_signing_key_seed: &[u8],
+) -> Result<Vec<u8>, PairVerifyError> {
+    build_pairverify_signature_plaintext(
+        server_public_key,
+        server_identifier,
+        client_public_key,
+        server_signing_key_seed,
+    )
+}
+
 pub fn build_pairverify_m3_plaintext(
     client_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
     client_identifier: &[u8],
     server_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
     client_signing_key_seed: &[u8],
 ) -> Result<Vec<u8>, PairVerifyError> {
-    let signing_key_seed = array_32(TLV_IDENTIFIER, client_signing_key_seed)?;
+    build_pairverify_signature_plaintext(
+        client_public_key,
+        client_identifier,
+        server_public_key,
+        client_signing_key_seed,
+    )
+}
+
+fn build_pairverify_signature_plaintext(
+    signer_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    signer_identifier: &[u8],
+    peer_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    signing_key_seed: &[u8],
+) -> Result<Vec<u8>, PairVerifyError> {
+    let signing_key_seed = array_32(TLV_IDENTIFIER, signing_key_seed)?;
     let signing_key = SigningKey::from_bytes(&signing_key_seed);
     let mut transcript = Vec::with_capacity(
-        client_public_key.len() + client_identifier.len() + server_public_key.len(),
+        signer_public_key.len() + signer_identifier.len() + peer_public_key.len(),
     );
-    transcript.extend_from_slice(client_public_key);
-    transcript.extend_from_slice(client_identifier);
-    transcript.extend_from_slice(server_public_key);
+    transcript.extend_from_slice(signer_public_key);
+    transcript.extend_from_slice(signer_identifier);
+    transcript.extend_from_slice(peer_public_key);
     let signature = signing_key.sign(&transcript);
 
     Ok(encode_tlv8(&[
-        (TLV_IDENTIFIER, client_identifier),
+        (TLV_IDENTIFIER, signer_identifier),
         (TLV_SIGNATURE, &signature.to_bytes()),
+    ]))
+}
+
+pub fn build_pairverify_m2(
+    server_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    key: &[u8; PAIRVERIFY_KEY_LENGTH],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, PairVerifyError> {
+    let encrypted = encrypt_pairverify_m2(key, plaintext)?;
+    Ok(encode_tlv8(&[
+        (TLV_STATE, &[2]),
+        (TLV_PUBLIC_KEY, server_public_key),
+        (TLV_ENCRYPTED_DATA, encrypted.as_slice()),
     ]))
 }
 
@@ -272,6 +339,14 @@ pub fn build_pairverify_m3(
     ]))
 }
 
+pub fn build_pairverify_m4() -> Vec<u8> {
+    encode_tlv8(&[(TLV_STATE, &[4])])
+}
+
+pub fn build_pairverify_error(state: u8, error: u8) -> Vec<u8> {
+    encode_tlv8(&[(TLV_ERROR, &[error]), (TLV_STATE, &[state])])
+}
+
 pub fn verify_pairverify_m2_signature(
     server_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
     server_identifier: &[u8],
@@ -279,14 +354,46 @@ pub fn verify_pairverify_m2_signature(
     server_signing_key: &[u8],
     signature: &[u8; 64],
 ) -> Result<(), PairVerifyError> {
-    let verifying_key = VerifyingKey::from_bytes(&array_32(TLV_PUBLIC_KEY, server_signing_key)?)
+    verify_pairverify_signature(
+        server_public_key,
+        server_identifier,
+        client_public_key,
+        server_signing_key,
+        signature,
+    )
+}
+
+pub fn verify_pairverify_m3_signature(
+    client_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    client_identifier: &[u8],
+    server_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    client_signing_key: &[u8],
+    signature: &[u8; 64],
+) -> Result<(), PairVerifyError> {
+    verify_pairverify_signature(
+        client_public_key,
+        client_identifier,
+        server_public_key,
+        client_signing_key,
+        signature,
+    )
+}
+
+fn verify_pairverify_signature(
+    signer_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    signer_identifier: &[u8],
+    peer_public_key: &[u8; PAIRVERIFY_PUBLIC_KEY_LENGTH],
+    signing_public_key: &[u8],
+    signature: &[u8; 64],
+) -> Result<(), PairVerifyError> {
+    let verifying_key = VerifyingKey::from_bytes(&array_32(TLV_PUBLIC_KEY, signing_public_key)?)
         .map_err(|_| PairVerifyError::Signature)?;
     let mut transcript = Vec::with_capacity(
-        server_public_key.len() + server_identifier.len() + client_public_key.len(),
+        signer_public_key.len() + signer_identifier.len() + peer_public_key.len(),
     );
-    transcript.extend_from_slice(server_public_key);
-    transcript.extend_from_slice(server_identifier);
-    transcript.extend_from_slice(client_public_key);
+    transcript.extend_from_slice(signer_public_key);
+    transcript.extend_from_slice(signer_identifier);
+    transcript.extend_from_slice(peer_public_key);
     let signature = Signature::from_bytes(signature);
     verifying_key
         .verify(&transcript, &signature)
@@ -432,6 +539,76 @@ mod tests {
         assert_eq!(
             decrypt_pairverify_data(&key, PAIR_VERIFY_M3_NONCE, &encrypted).unwrap(),
             plaintext
+        );
+    }
+
+    #[test]
+    fn pairverify_server_and_client_messages_round_trip() {
+        let client_ephemeral = PairVerifyKeyPair::from_secret_bytes([0x11; 32]);
+        let server_ephemeral = PairVerifyKeyPair::from_secret_bytes([0x22; 32]);
+        let client_identity_seed = [0x33; 32];
+        let server_identity_seed = [0x44; 32];
+        let client_signing_public = ed25519_public_key_from_seed(&client_identity_seed).unwrap();
+        let server_signing_public = ed25519_public_key_from_seed(&server_identity_seed).unwrap();
+        let client_identifier = b"client";
+        let server_identifier = b"server";
+
+        let shared_secret = server_ephemeral
+            .shared_secret(&client_ephemeral.public_key())
+            .unwrap();
+        assert_eq!(
+            shared_secret,
+            client_ephemeral
+                .shared_secret(&server_ephemeral.public_key())
+                .unwrap()
+        );
+
+        let key = derive_pairverify_key(&shared_secret).unwrap();
+        let m2_plaintext = build_pairverify_m2_plaintext(
+            &server_ephemeral.public_key(),
+            server_identifier,
+            &client_ephemeral.public_key(),
+            &server_identity_seed,
+        )
+        .unwrap();
+        let m2 = build_pairverify_m2(&server_ephemeral.public_key(), &key, &m2_plaintext).unwrap();
+        let parsed_m2 = parse_pairverify_m2(&client_ephemeral, &m2).unwrap();
+        let decrypted_m2 = parsed_m2.decrypted_fields.unwrap();
+        verify_pairverify_m2_signature(
+            &server_ephemeral.public_key(),
+            server_identifier,
+            &client_ephemeral.public_key(),
+            &server_signing_public,
+            decrypted_m2.signature.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        let m3_plaintext = build_pairverify_m3_plaintext(
+            &client_ephemeral.public_key(),
+            client_identifier,
+            &server_ephemeral.public_key(),
+            &client_identity_seed,
+        )
+        .unwrap();
+        let m3 = build_pairverify_m3(&key, &m3_plaintext).unwrap();
+        let m3_fields = parse_pairverify_tlv(&m3).unwrap();
+        let decrypted_m3 = parse_pairverify_tlv(
+            &decrypt_pairverify_m3(&key, m3_fields.encrypted_data.as_deref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        verify_pairverify_m3_signature(
+            &client_ephemeral.public_key(),
+            client_identifier,
+            &server_ephemeral.public_key(),
+            &client_signing_public,
+            decrypted_m3.signature.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(build_pairverify_m4(), encode_tlv8(&[(TLV_STATE, &[4])]));
+        assert_eq!(
+            build_pairverify_error(3, PAIR_VERIFY_ERROR_AUTHENTICATION),
+            encode_tlv8(&[(TLV_ERROR, &[PAIR_VERIFY_ERROR_AUTHENTICATION]), (TLV_STATE, &[3])]),
         );
     }
 }

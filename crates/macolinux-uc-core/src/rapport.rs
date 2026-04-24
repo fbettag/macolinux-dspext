@@ -2,6 +2,9 @@ use std::error::Error;
 use std::fmt;
 
 pub const FRAME_HEADER_LEN: usize = 4;
+pub const FRAME_TYPE_U_OPACK: u8 = 0x07;
+pub const FRAME_TYPE_E_OPACK: u8 = 0x08;
+pub const FRAME_TYPE_P_OPACK: u8 = 0x09;
 pub const STATUS_FLAG_BASE: u64 = 1 << 2;
 pub const STATUS_FLAG_APPLE_PAY: u64 = 1 << 23;
 pub const STATUS_FLAG_DEVICE_INFO_PAIRING_HINT: u64 = 1 << 24;
@@ -86,9 +89,9 @@ pub fn frame_type_name(frame_type: u8) -> &'static str {
         0x04 => "PairSetupNext",
         0x05 => "PairVerifyStart",
         0x06 => "PairVerifyNext",
-        0x07 => "U_OPACK",
-        0x08 => "E_OPACK",
-        0x09 => "P_OPACK",
+        FRAME_TYPE_U_OPACK => "U_OPACK",
+        FRAME_TYPE_E_OPACK => "E_OPACK",
+        FRAME_TYPE_P_OPACK => "P_OPACK",
         0x0a => "PA_Req",
         0x0b => "PA_Rsp",
         0x12 => "FamilyIdentityRequest",

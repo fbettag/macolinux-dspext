@@ -22,11 +22,11 @@ pub struct LinuxIdentity {
     pub created_unix_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct PublicPeerIdentity<'a> {
-    version: u32,
-    identifier: &'a str,
-    ed25519_public_key_hex: &'a str,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicPeerIdentity {
+    pub version: u32,
+    pub identifier: String,
+    pub ed25519_public_key_hex: String,
 }
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -132,6 +132,50 @@ impl LinuxIdentity {
         }
         Ok(seed)
     }
+
+    pub fn public_peer(&self) -> PublicPeerIdentity {
+        PublicPeerIdentity {
+            version: self.version,
+            identifier: self.identifier.clone(),
+            ed25519_public_key_hex: self.ed25519_public_key_hex.clone(),
+        }
+    }
+}
+
+impl PublicPeerIdentity {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
+        let text = fs::read_to_string(path.as_ref())?;
+        let peer: Self = serde_json::from_str(&text)?;
+        peer.validate()?;
+        Ok(peer)
+    }
+
+    pub fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if self.version != IDENTITY_VERSION {
+            return Err(
+                IdentityError(format!("unsupported public peer version: {}", self.version)).into(),
+            );
+        }
+        if self.identifier.is_empty() {
+            return Err(IdentityError("peer identifier must not be empty".into()).into());
+        }
+        if self.ed25519_public_key()?.len() != 32 {
+            return Err(IdentityError("peer public key must be 32 bytes".into()).into());
+        }
+        Ok(())
+    }
+
+    pub fn ed25519_public_key(&self) -> Result<Vec<u8>, Box<dyn Error>> {
+        let public_key = parse_hex(&self.ed25519_public_key_hex)?;
+        if public_key.len() != 32 {
+            return Err(IdentityError(format!(
+                "peer public key must be 32 bytes, got {}",
+                public_key.len()
+            ))
+            .into());
+        }
+        Ok(public_key)
+    }
 }
 
 fn run_create(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -190,11 +234,7 @@ fn run_export_peer(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let identity = LinuxIdentity::load(&path)?;
-    let public = PublicPeerIdentity {
-        version: identity.version,
-        identifier: &identity.identifier,
-        ed25519_public_key_hex: &identity.ed25519_public_key_hex,
-    };
+    let public = identity.public_peer();
     println!("{}", serde_json::to_string_pretty(&public)?);
     Ok(())
 }
@@ -282,5 +322,8 @@ mod tests {
             32
         );
         identity.validate().unwrap();
+        let public = identity.public_peer();
+        public.validate().unwrap();
+        assert_eq!(public.identifier, "fistel-test");
     }
 }
