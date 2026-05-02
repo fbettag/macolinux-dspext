@@ -5,15 +5,13 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Debug, Clone)]
 struct InputListenConfig {
     bind: SocketAddr,
     device: String,
     dry_run: bool,
     accept_timeout: Option<Duration>,
-    read_timeout: Duration,
+    read_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +56,10 @@ fn run_listen(args: &[String]) -> Result<(), Box<dyn Error>> {
         local_addr,
         config.device,
         config.dry_run,
-        config.read_timeout.as_millis()
+        config
+            .read_timeout
+            .map(|timeout| timeout.as_millis().to_string())
+            .unwrap_or_else(|| "none".into())
     );
 
     if let Some(timeout) = config.accept_timeout {
@@ -96,7 +97,8 @@ fn spawn_connection(config: InputListenConfig, stream: TcpStream) {
 fn handle_connection(config: InputListenConfig, stream: TcpStream) -> Result<(), Box<dyn Error>> {
     let peer = stream.peer_addr()?;
     println!("input connected: peer={peer}");
-    stream.set_read_timeout(Some(config.read_timeout))?;
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(config.read_timeout)?;
     let reader = BufReader::new(stream);
 
     let mut sink = InputSink::open(&config.device, config.dry_run)?;
@@ -121,7 +123,7 @@ impl InputListenConfig {
             device: "/dev/uinput".into(),
             dry_run: false,
             accept_timeout: None,
-            read_timeout: DEFAULT_READ_TIMEOUT,
+            read_timeout: None,
         };
 
         let mut iter = args.iter();
@@ -136,15 +138,16 @@ impl InputListenConfig {
                     )?)?));
                 }
                 "--read-timeout-ms" => {
-                    config.read_timeout =
-                        Duration::from_millis(parse_u64(&next_value(&mut iter, arg)?)?);
+                    config.read_timeout = Some(Duration::from_millis(parse_u64(&next_value(
+                        &mut iter, arg,
+                    )?)?));
                 }
                 "-h" | "--help" => return Err(InputError(usage().into())),
                 other => return Err(InputError(format!("unknown input listen option: {other}"))),
             }
         }
 
-        if config.read_timeout.is_zero() {
+        if config.read_timeout.is_some_and(|timeout| timeout.is_zero()) {
             return Err(InputError("--read-timeout-ms must be at least 1".into()));
         }
         Ok(config)
@@ -628,6 +631,8 @@ mod tests {
         assert_eq!(config.bind, SocketAddr::from(([127, 0, 0, 1], 4720)));
         assert_eq!(config.device, "/dev/uinput");
         assert!(!config.dry_run);
+        assert_eq!(config.accept_timeout, None);
+        assert_eq!(config.read_timeout, None);
     }
 
     #[test]
@@ -649,7 +654,7 @@ mod tests {
         assert_eq!(config.device, "/tmp/uinput");
         assert!(config.dry_run);
         assert_eq!(config.accept_timeout, Some(Duration::from_millis(25)));
-        assert_eq!(config.read_timeout, Duration::from_millis(50));
+        assert_eq!(config.read_timeout, Some(Duration::from_millis(50)));
     }
 
     #[test]
