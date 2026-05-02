@@ -5,6 +5,8 @@ host="${HOST:-fistel}"
 port="${PORT:-4720}"
 target="${TARGET:-.#fistel}"
 nixos_dir="${NIXOS_DIR:-/etc/nixos}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "$script_dir/.." && pwd)"
 edge="${EDGE:-right}"
 remote_width="${REMOTE_WIDTH:-1920}"
 remote_height="${REMOTE_HEIGHT:-1080}"
@@ -20,6 +22,7 @@ Environment:
   PORT=$port
   TARGET=$target
   NIXOS_DIR=$nixos_dir
+  REPO_DIR=$repo_dir
   EDGE=$edge
   REMOTE_WIDTH=$remote_width
   REMOTE_HEIGHT=$remote_height
@@ -78,14 +81,14 @@ ssh "root@$host" '
 '
 
 echo "running macOS-to-Linux input self-test ..."
-nix run .#macolinux-macos-input-forwarder -- \
+nix run "$repo_dir#macolinux-macos-input-forwarder" -- \
   --host "$host" \
   --port "$port" \
   --self-test
 
 if [[ "$live" -eq 1 ]]; then
   echo "starting live bridge; move into the configured $edge edge to enter Linux input."
-  exec nix run .#macolinux-macos-input-forwarder -- \
+  exec nix run "$repo_dir#macolinux-macos-input-forwarder" -- \
     --host "$host" \
     --port "$port" \
     --edge "$edge" \
