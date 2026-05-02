@@ -203,6 +203,16 @@ Move the pointer into the configured edge to enter the Linux input region; move
 back past the remote edge to release control to macOS. For validation without
 sending events to Linux, add `--dry-run --always-grab`.
 
+To verify the network and Linux receiver path without granting macOS input
+capture permissions, run a bounded self-test:
+
+```sh
+nix run .#macolinux-macos-input-forwarder -- \
+  --host 192.0.2.11 \
+  --port 4720 \
+  --self-test
+```
+
 ## NixOS Module
 
 The flake exposes `nixosModules.default`. A later `/etc/nixos` integration for

@@ -22,6 +22,7 @@ typedef struct {
     int threshold;
     bool always_grab;
     bool dry_run;
+    bool self_test;
 } Config;
 
 typedef struct {
@@ -35,6 +36,8 @@ typedef struct {
 
 static volatile sig_atomic_t g_stop = 0;
 
+static bool send_line(State *state, const char *fmt, ...);
+
 static void handle_signal(int signo) {
     (void)signo;
     g_stop = 1;
@@ -45,7 +48,7 @@ static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s --host HOST --port PORT [--edge right|left] "
             "[--remote-width PX] [--remote-height PX] [--threshold PX] "
-            "[--always-grab] [--dry-run]\n",
+            "[--always-grab] [--dry-run] [--self-test]\n",
             argv0);
 }
 
@@ -69,6 +72,7 @@ static bool parse_config(int argc, char **argv, Config *config) {
         .threshold = 2,
         .always_grab = false,
         .dry_run = false,
+        .self_test = false,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -105,6 +109,8 @@ static bool parse_config(int argc, char **argv, Config *config) {
             config->always_grab = true;
         } else if (strcmp(arg, "--dry-run") == 0) {
             config->dry_run = true;
+        } else if (strcmp(arg, "--self-test") == 0) {
+            config->self_test = true;
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             return false;
         } else {
@@ -118,6 +124,19 @@ static bool parse_config(int argc, char **argv, Config *config) {
         return false;
     }
     return true;
+}
+
+static bool run_self_test(State *state) {
+    bool ok = true;
+    ok = send_line(state, "MOVE 8 0\n") && ok;
+    ok = send_line(state, "MOVE -8 0\n") && ok;
+    ok = send_line(state, "BTN left down\n") && ok;
+    ok = send_line(state, "BTN left up\n") && ok;
+    ok = send_line(state, "KEY 30 down\n") && ok;
+    ok = send_line(state, "KEY 30 up\n") && ok;
+    ok = send_line(state, "SCROLL 1 0\n") && ok;
+    ok = send_line(state, "SCROLL -1 0\n") && ok;
+    return ok;
 }
 
 static int connect_tcp(const char *host, int port) {
@@ -498,14 +517,6 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
-    if (!AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options)) {
-        fprintf(stderr,
-                "Accessibility permission is required. Grant it to this binary or its parent "
-                "terminal/app, then run the command again.\n");
-        return 1;
-    }
-
     State state;
     memset(&state, 0, sizeof(state));
     state.config = config;
@@ -518,6 +529,21 @@ int main(int argc, char **argv) {
             fprintf(stderr, "failed to connect to %s:%d\n", config.host, config.port);
             return 1;
         }
+    }
+
+    if (config.self_test) {
+        bool ok = run_self_test(&state);
+        if (state.fd >= 0) close(state.fd);
+        return ok ? 0 : 1;
+    }
+
+    NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
+    if (!AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options)) {
+        fprintf(stderr,
+                "Accessibility permission is required. Grant it to this binary or its parent "
+                "terminal/app, then run the command again.\n");
+        if (state.fd >= 0) close(state.fd);
+        return 1;
     }
 
     if (config.always_grab) {
