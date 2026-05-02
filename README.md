@@ -235,6 +235,13 @@ after a successful deploy/self-test:
 scripts/fistel-session.sh --no-deploy --live
 ```
 
+The helper defaults to `HOST=172.16.1.11` so it does not depend on macOS resolver
+state. Override it when needed:
+
+```sh
+HOST=fistel scripts/fistel-session.sh
+```
+
 ## NixOS Module
 
 The flake exposes `nixosModules.default`. A later `/etc/nixos` integration for

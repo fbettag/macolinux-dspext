@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-host="${HOST:-fistel}"
+host="${HOST:-172.16.1.11}"
 port="${PORT:-4720}"
 target="${TARGET:-.#fistel}"
 nixos_dir="${NIXOS_DIR:-/etc/nixos}"
