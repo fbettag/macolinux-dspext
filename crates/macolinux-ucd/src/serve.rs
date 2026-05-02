@@ -14,8 +14,8 @@ use macolinux_uc_core::pairing_stream::{PairingStream, PairingStreamEndpoint};
 use macolinux_uc_core::pairverify::{
     build_pairverify_error, build_pairverify_m2, build_pairverify_m2_plaintext,
     build_pairverify_m4, decrypt_pairverify_m3, derive_pairverify_key, parse_pairverify_tlv,
-    verify_pairverify_m3_signature, PairVerifyFields, PairVerifyKeyPair,
-    PAIR_VERIFY_ERROR_AUTHENTICATION, PAIRVERIFY_KEY_LENGTH,
+    verify_pairverify_m3_signature, PairVerifyFields, PairVerifyKeyPair, PAIRVERIFY_KEY_LENGTH,
+    PAIR_VERIFY_ERROR_AUTHENTICATION,
 };
 use macolinux_uc_core::rapport::{frame_type_name, RapportFrame, FRAME_TYPE_E_OPACK};
 
@@ -190,12 +190,12 @@ impl ServeConfig {
                     config.ble.nearby_action = Some(next_value(&mut iter, arg)?)
                 }
                 "--ble-tlv" => config.ble.tlvs.push(next_value(&mut iter, arg)?),
-                "--identity" => config.identity_path = Some(PathBuf::from(next_value(&mut iter, arg)?)),
-                "--trusted-peer" => {
-                    config
-                        .trusted_peer_paths
-                        .push(PathBuf::from(next_value(&mut iter, arg)?))
+                "--identity" => {
+                    config.identity_path = Some(PathBuf::from(next_value(&mut iter, arg)?))
                 }
+                "--trusted-peer" => config
+                    .trusted_peer_paths
+                    .push(PathBuf::from(next_value(&mut iter, arg)?)),
                 "--allow-unknown-peer" => config.allow_unknown_peer = true,
                 "--stream-bind" => {
                     config.stream_bind = parse_socket_addr(&next_value(&mut iter, arg)?)?
@@ -292,9 +292,10 @@ impl PairVerifyRuntime {
             let peer = PublicPeerIdentity::load(path)?;
             let signing_public_key =
                 fixed_32(peer.ed25519_public_key()?, "trusted peer public key")?;
-            trusted_peers.insert(peer.identifier.as_bytes().to_vec(), TrustedPeer {
-                signing_public_key,
-            });
+            trusted_peers.insert(
+                peer.identifier.as_bytes().to_vec(),
+                TrustedPeer { signing_public_key },
+            );
         }
 
         Ok(Self {
@@ -337,7 +338,10 @@ fn run_mdns_advertiser(advert: MdnsAdvert) -> ! {
     }
 }
 
-fn handle_tcp_client(mut stream: TcpStream, runtime: Arc<ServeRuntime>) -> Result<(), Box<dyn Error>> {
+fn handle_tcp_client(
+    mut stream: TcpStream,
+    runtime: Arc<ServeRuntime>,
+) -> Result<(), Box<dyn Error>> {
     let peer = stream.peer_addr()?;
     let mut pending_pairverify = None;
     let mut pairing_stream = None;
@@ -379,24 +383,14 @@ fn handle_tcp_client(mut stream: TcpStream, runtime: Arc<ServeRuntime>) -> Resul
                     ServeError("internal error: PairVerify state without runtime".into())
                 })?;
                 let pending = pending_pairverify.take().unwrap();
-                pairing_stream = handle_pairverify_m3(
-                    &mut stream,
-                    pairverify,
-                    pending,
-                    &frame,
-                )?;
+                pairing_stream = handle_pairverify_m3(&mut stream, pairverify, pending, &frame)?;
             }
             FRAME_TYPE_E_OPACK => {
                 let Some(pairing_stream) = pairing_stream.as_mut() else {
                     println!("dropping encrypted frame before PairVerify completed");
                     continue;
                 };
-                handle_encrypted_frame(
-                    &mut stream,
-                    pairing_stream,
-                    &mut stream_manager,
-                    &frame,
-                )?;
+                handle_encrypted_frame(&mut stream, pairing_stream, &mut stream_manager, &frame)?;
             }
             _ => {
                 if let Ok(value) = decode_opack(&frame.body) {
@@ -411,10 +405,7 @@ fn handle_preauth(stream: &mut TcpStream, frame: &RapportFrame) -> Result<(), Bo
     if let Ok(value) = decode_opack(&frame.body) {
         println!("preauth request opack={}", format_opack(&value));
     }
-    let body = encode_opack(&dict([(
-        "_sv",
-        OpackValue::String(PREAUTH_VERSION.into()),
-    )]))?;
+    let body = encode_opack(&dict([("_sv", OpackValue::String(PREAUTH_VERSION.into()))]))?;
     write_rapport_frame(
         stream,
         &RapportFrame {
@@ -448,7 +439,11 @@ fn handle_pairverify_m1(
         &client_public_key,
         &pairverify.identity.seed,
     )?;
-    let m2_tlv = build_pairverify_m2(&server_ephemeral.public_key(), &encryption_key, &m2_plaintext)?;
+    let m2_tlv = build_pairverify_m2(
+        &server_ephemeral.public_key(),
+        &encryption_key,
+        &m2_plaintext,
+    )?;
     send_pairverify_result(stream, 0x06, m2_tlv)?;
 
     Ok(PendingPairVerify {
@@ -563,7 +558,10 @@ fn handle_encrypted_frame(
     let response = CompanionResponse::for_request(&request, empty_dict());
     let response_frame = pairing_stream.encrypt_e_opack_frame(&response.to_opack_value())?;
     write_rapport_frame(stream, &response_frame)?;
-    println!("encrypted request replied with empty response: {}", request.request_id);
+    println!(
+        "encrypted request replied with empty response: {}",
+        request.request_id
+    );
     Ok(())
 }
 

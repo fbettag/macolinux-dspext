@@ -1,4 +1,6 @@
-{ self ? null }:
+{
+  self ? null,
+}:
 {
   config,
   lib,
@@ -14,60 +16,71 @@ let
       self.packages.${system}.macolinux-ucd
     else
       pkgs.callPackage ./package.nix { src = ../.; };
-  optionalArg = flag: value: lib.optionals (value != null) [
-    flag
-    value
-  ];
-  bleArgs =
-    lib.optionals cfg.ble.enable (
-      [
-        "--ble-enable"
-        "--btmgmt-path"
-        "${cfg.ble.bluezPackage}/bin/btmgmt"
-        "--ble-index"
-        cfg.ble.index
-        "--ble-instance"
-        (toString cfg.ble.instance)
-        "--ble-duration"
-        (toString cfg.ble.duration)
-        "--ble-length-flags"
-        (toString cfg.ble.lengthFlags)
-      ]
-      ++ optionalArg "--ble-flags" cfg.ble.flags
-      ++ optionalArg "--ble-nearby-action" cfg.ble.nearbyAction
-      ++ optionalArg "--ble-nearby-info" cfg.ble.nearbyInfo
-      ++ lib.concatMap (tlv: [
-        "--ble-tlv"
-        tlv
-      ]) cfg.ble.tlvs
-    );
-  serviceArgs =
+  optionalArg =
+    flag: value:
+    lib.optionals (value != null) [
+      flag
+      value
+    ];
+  bleArgs = lib.optionals cfg.ble.enable (
     [
-      "${lib.getExe cfg.package}"
-      "serve"
-      "--instance"
-      cfg.instance
-      "--port"
-      (toString cfg.port)
+      "--ble-enable"
+      "--btmgmt-path"
+      "${cfg.ble.bluezPackage}/bin/btmgmt"
+      "--ble-index"
+      cfg.ble.index
+      "--ble-instance"
+      (toString cfg.ble.instance)
+      "--ble-duration"
+      (toString cfg.ble.duration)
+      "--ble-length-flags"
+      (toString cfg.ble.lengthFlags)
     ]
-    ++ optionalArg "--hostname" cfg.hostname
-    ++ optionalArg "--ipv4" cfg.ipv4
-    ++ optionalArg "--multicast-ipv4" cfg.multicastIpv4
-    ++ optionalArg "--ble-address" cfg.bleAddress
-    ++ optionalArg "--identity" cfg.identityPath
-    ++ lib.concatMap (peer: [
-      "--trusted-peer"
-      peer
-    ]) cfg.trustedPeers
-    ++ lib.optionals cfg.allowUnknownPeer [ "--allow-unknown-peer" ]
-    ++ optionalArg "--stream-bind" cfg.streamBind
-    ++ optionalArg "--stream-advertise-addr" cfg.streamAdvertiseAddr
-    ++ lib.concatMap (txt: [
-      "--txt"
-      txt
-    ]) cfg.txt
-    ++ bleArgs
-    ++ cfg.extraArgs;
+    ++ optionalArg "--ble-flags" cfg.ble.flags
+    ++ optionalArg "--ble-nearby-action" cfg.ble.nearbyAction
+    ++ optionalArg "--ble-nearby-info" cfg.ble.nearbyInfo
+    ++ lib.concatMap (tlv: [
+      "--ble-tlv"
+      tlv
+    ]) cfg.ble.tlvs
+  );
+  inputArgs = [
+    "${lib.getExe cfg.package}"
+    "input"
+    "listen"
+    "--bind"
+    cfg.input.bind
+    "--device"
+    cfg.input.device
+  ]
+  ++ lib.optionals cfg.input.dryRun [ "--dry-run" ]
+  ++ cfg.input.extraArgs;
+  serviceArgs = [
+    "${lib.getExe cfg.package}"
+    "serve"
+    "--instance"
+    cfg.instance
+    "--port"
+    (toString cfg.port)
+  ]
+  ++ optionalArg "--hostname" cfg.hostname
+  ++ optionalArg "--ipv4" cfg.ipv4
+  ++ optionalArg "--multicast-ipv4" cfg.multicastIpv4
+  ++ optionalArg "--ble-address" cfg.bleAddress
+  ++ optionalArg "--identity" cfg.identityPath
+  ++ lib.concatMap (peer: [
+    "--trusted-peer"
+    peer
+  ]) cfg.trustedPeers
+  ++ lib.optionals cfg.allowUnknownPeer [ "--allow-unknown-peer" ]
+  ++ optionalArg "--stream-bind" cfg.streamBind
+  ++ optionalArg "--stream-advertise-addr" cfg.streamAdvertiseAddr
+  ++ lib.concatMap (txt: [
+    "--txt"
+    txt
+  ]) cfg.txt
+  ++ bleArgs
+  ++ cfg.extraArgs;
 in
 {
   options.services.macolinux-uc = {
@@ -237,6 +250,35 @@ in
       };
     };
 
+    input = {
+      enable = lib.mkEnableOption "Linux uinput receiver for decoded Universal Control pointer and keyboard events";
+
+      bind = lib.mkOption {
+        type = lib.types.str;
+        default = "127.0.0.1:4720";
+        example = "0.0.0.0:4720";
+        description = "TCP address for the local input line-protocol receiver.";
+      };
+
+      device = lib.mkOption {
+        type = lib.types.str;
+        default = "/dev/uinput";
+        description = "uinput device used for virtual keyboard and pointer injection.";
+      };
+
+      dryRun = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Log decoded input commands without writing to uinput.";
+      };
+
+      extraArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Additional command-line arguments for the input listener.";
+      };
+    };
+
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -247,15 +289,17 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion =
-          cfg.identityPath != null
-          || (cfg.trustedPeers == [ ] && cfg.allowUnknownPeer == false);
+        assertion = cfg.identityPath != null || (cfg.trustedPeers == [ ] && cfg.allowUnknownPeer == false);
         message = "services.macolinux-uc.identityPath must be set when trustedPeers or allowUnknownPeer is enabled.";
       }
     ];
 
-    environment.systemPackages = [ cfg.package ] ++ lib.optionals cfg.ble.enable [ cfg.ble.bluezPackage ];
+    environment.systemPackages = [
+      cfg.package
+    ]
+    ++ lib.optionals cfg.ble.enable [ cfg.ble.bluezPackage ];
     hardware.bluetooth.enable = lib.mkDefault cfg.ble.enable;
+    boot.kernelModules = lib.mkIf cfg.input.enable [ "uinput" ];
 
     systemd.services.macolinux-uc = {
       description = "macolinux Universal Control Linux peer daemon";
@@ -271,6 +315,19 @@ in
         Restart = "on-failure";
         User = cfg.user;
         Group = cfg.group;
+      };
+    };
+
+    systemd.services.macolinux-uc-input = lib.mkIf cfg.input.enable {
+      description = "macolinux Universal Control virtual input receiver";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs inputArgs;
+        Restart = "on-failure";
+        User = "root";
+        Group = "root";
       };
     };
   };

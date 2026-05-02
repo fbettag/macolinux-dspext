@@ -9,7 +9,12 @@ repository.workspace = true
 name = "macolinux-ucd"
 path = "src/main.rs"
 
+[[bin]]
+name = "macolinux-uc-bootstrap"
+path = "src/bin/macos_bootstrap.rs"
+
 [dependencies]
+libc = "0.2.185"
 macolinux-uc-core = { path = "../macolinux-uc-core" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

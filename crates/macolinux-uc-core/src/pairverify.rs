@@ -608,7 +608,10 @@ mod tests {
         assert_eq!(build_pairverify_m4(), encode_tlv8(&[(TLV_STATE, &[4])]));
         assert_eq!(
             build_pairverify_error(3, PAIR_VERIFY_ERROR_AUTHENTICATION),
-            encode_tlv8(&[(TLV_ERROR, &[PAIR_VERIFY_ERROR_AUTHENTICATION]), (TLV_STATE, &[3])]),
+            encode_tlv8(&[
+                (TLV_ERROR, &[PAIR_VERIFY_ERROR_AUTHENTICATION]),
+                (TLV_STATE, &[3])
+            ]),
         );
     }
 }

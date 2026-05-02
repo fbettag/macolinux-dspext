@@ -37,6 +37,10 @@ DLT_RAW = 101
 RAPPORT_FRAME_TYPES = {
     0x00: "Invalid",
     0x01: "NoOp",
+    0x03: "PairSetupStart",
+    0x04: "PairSetupNext",
+    0x05: "PairVerifyStart",
+    0x06: "PairVerifyNext",
     0x07: "U_OPACK",
     0x08: "E_OPACK",
     0x09: "P_OPACK",
@@ -52,6 +56,11 @@ RAPPORT_FRAME_TYPES = {
     0x41: "FriendIdentityResponse",
     0x42: "FriendIdentityUpdate",
 }
+
+# Keep the dependency-free parser conservative. If TCP data starts in the middle
+# of an encrypted record, the first four bytes can accidentally resemble a
+# known frame type with a nonsensical length.
+MAX_REASONABLE_RECORD_BODY_LEN = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -85,12 +94,14 @@ def read_pcap(path: Path):
             if not raw_header:
                 break
             if len(raw_header) != packet_header.size:
-                raise ValueError("truncated packet header")
+                print("warning: ignoring truncated pcap packet header", file=sys.stderr)
+                break
 
             ts_sec, ts_frac, incl_len, _orig_len = packet_header.unpack(raw_header)
             data = f.read(incl_len)
             if len(data) != incl_len:
-                raise ValueError("truncated packet data")
+                print("warning: ignoring truncated pcap packet data", file=sys.stderr)
+                break
 
             yield precision, linktype, ts_sec, ts_frac, data
 
@@ -172,6 +183,8 @@ def record_header(payload: bytes) -> tuple[int, int] | None:
     frame_type = payload[0]
     body_len = int.from_bytes(payload[1:4], "big")
     if frame_type not in RAPPORT_FRAME_TYPES:
+        return None
+    if body_len > MAX_REASONABLE_RECORD_BODY_LEN:
         return None
 
     return frame_type, body_len

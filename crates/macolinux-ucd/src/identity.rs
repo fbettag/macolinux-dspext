@@ -152,9 +152,11 @@ impl PublicPeerIdentity {
 
     pub fn validate(&self) -> Result<(), Box<dyn Error>> {
         if self.version != IDENTITY_VERSION {
-            return Err(
-                IdentityError(format!("unsupported public peer version: {}", self.version)).into(),
-            );
+            return Err(IdentityError(format!(
+                "unsupported public peer version: {}",
+                self.version
+            ))
+            .into());
         }
         if self.identifier.is_empty() {
             return Err(IdentityError("peer identifier must not be empty".into()).into());

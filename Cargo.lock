@@ -441,6 +441,7 @@ dependencies = [
 name = "macolinux-ucd"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "macolinux-uc-core",
  "serde",
  "serde_json",

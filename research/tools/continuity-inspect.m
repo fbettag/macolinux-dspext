@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
+#import <Network/Network.h>
 #import <Security/Security.h>
 #import <dlfcn.h>
+#import <objc/message.h>
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
 
@@ -10,7 +12,8 @@ static NSArray<NSString *> *FrameworkPaths(void) {
         @"/System/Library/PrivateFrameworks/Rapport.framework/Rapport",
         @"/System/Library/PrivateFrameworks/Sharing.framework/Sharing",
         @"/System/Library/PrivateFrameworks/IDS.framework/IDS",
-        @"/System/Library/PrivateFrameworks/IDSFoundation.framework/IDSFoundation"
+        @"/System/Library/PrivateFrameworks/IDSFoundation.framework/IDSFoundation",
+        @"/System/Library/Frameworks/Network.framework/Network"
     ];
 }
 
@@ -27,6 +30,9 @@ static BOOL StringContains(NSString *haystack, NSString *needle) {
     }
     return [haystack rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
 }
+
+static NSData *DataFromProbeArgument(NSString *argument);
+static void PrintPairingControllerXPCState(id controller, const char *label);
 
 static NSString *SafeString(id object) {
     if (!object || object == (id)kCFNull) {
@@ -62,18 +68,44 @@ static void PrintClassList(NSString *filter) {
     }
 }
 
-static void PrintMethods(Class cls, BOOL meta) {
+static void PrintMethods(Class cls, BOOL meta, BOOL includeIMP, NSString *filter) {
     unsigned int count = 0;
     Method *methods = class_copyMethodList(meta ? object_getClass(cls) : cls, &count);
     printf("%s methods (%u):\n", meta ? "class" : "instance", count);
     for (unsigned int i = 0; i < count; i++) {
         SEL selector = method_getName(methods[i]);
         const char *types = method_getTypeEncoding(methods[i]);
-        printf("  %c[%s %s] %s\n",
+        NSString *selectorString = [NSString stringWithUTF8String:sel_getName(selector)];
+        if (!StringContains(selectorString, filter)) {
+            continue;
+        }
+        if (!includeIMP) {
+            printf("  %c[%s %s] %s\n",
+                   meta ? '+' : '-',
+                   class_getName(cls),
+                   sel_getName(selector),
+                   types ? types : "");
+            continue;
+        }
+        IMP imp = method_getImplementation(methods[i]);
+        Dl_info info = {0};
+        const char *image = "";
+        uintptr_t offset = 0;
+        if (imp && dladdr((const void *)imp, &info) && info.dli_fname && info.dli_fbase) {
+            image = info.dli_fname;
+            offset = (uintptr_t)imp - (uintptr_t)info.dli_fbase;
+        }
+        printf("  %c[%s %s] %s imp=%p image=%s",
                meta ? '+' : '-',
                class_getName(cls),
                sel_getName(selector),
-               types ? types : "");
+               types ? types : "",
+               imp,
+               image);
+        if (offset) {
+            printf(" offset=0x%llx", (unsigned long long)offset);
+        }
+        putchar('\n');
     }
     free(methods);
 }
@@ -118,8 +150,22 @@ static void PrintClassInfo(NSString *className) {
     }
     PrintProperties(cls);
     PrintIvars(cls);
-    PrintMethods(cls, NO);
-    PrintMethods(cls, YES);
+    PrintMethods(cls, NO, NO, nil);
+    PrintMethods(cls, YES, NO, nil);
+}
+
+static void PrintClassIMPs(NSString *className, NSString *filter) {
+    LoadContinuityFrameworks();
+
+    Class cls = NSClassFromString(className);
+    if (!cls) {
+        fprintf(stderr, "class not found: %s\n", className.UTF8String);
+        return;
+    }
+
+    printf("class %s\n", class_getName(cls));
+    PrintMethods(cls, NO, YES, filter);
+    PrintMethods(cls, YES, YES, filter);
 }
 
 static void PrintMethodSearch(NSString *filter) {
@@ -333,6 +379,258 @@ static NSString *DescribeString(id object) {
     return object ? NSStringFromClass([object class]) : @"nil";
 }
 
+static NSString *HexString(NSData *data, NSUInteger maxBytes) {
+    if (!data) {
+        return @"";
+    }
+    const uint8_t *bytes = data.bytes;
+    NSUInteger length = MIN(data.length, maxBytes);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:length * 2];
+    for (NSUInteger i = 0; i < length; i++) {
+        [hex appendFormat:@"%02x", bytes[i]];
+    }
+    if (data.length > maxBytes) {
+        [hex appendFormat:@"...(+%lu bytes)", (unsigned long)(data.length - maxBytes)];
+    }
+    return hex;
+}
+
+static void PrintCFObjectShape(CFTypeRef object, const char *label) {
+    if (!object) {
+        printf("%s: nil\n", label);
+        return;
+    }
+    CFStringRef description = CFCopyDescription(object);
+    char buffer[4096] = {0};
+    Boolean copied = description &&
+        CFStringGetCString(description, buffer, sizeof(buffer), kCFStringEncodingUTF8);
+    printf("%s: cfType=%lu class=%s desc=%s\n",
+           label,
+           CFGetTypeID(object),
+           object_getClassName((__bridge id)object),
+           copied ? buffer : "(description unavailable)");
+    if (CFGetTypeID(object) == CFDataGetTypeID()) {
+        NSData *data = (__bridge NSData *)object;
+        printf("%s: data_len=%lu hex=%s\n",
+               label,
+               (unsigned long)data.length,
+               HexString(data, 128).UTF8String);
+    }
+    if (description) {
+        CFRelease(description);
+    }
+}
+
+static void ProbeSecuritySPAKE(NSString *clientIdentity, NSString *serverIdentity, unsigned short scheme) {
+    LoadContinuityFrameworks();
+
+    void *security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW | RTLD_LOCAL);
+    printf("Security handle: %p\n", security);
+    NSArray<NSString *> *symbols = @[
+        @"sec_identity_create_client_SPAKE2PLUSV1_identity",
+        @"sec_identity_create_server_SPAKE2PLUSV1_identity",
+        @"sec_identity_copy_SPAKE2PLUSV1_client_identity",
+        @"sec_identity_copy_SPAKE2PLUSV1_server_identity",
+        @"sec_identity_copy_SPAKE2PLUSV1_context",
+        @"sec_identity_copy_SPAKE2PLUSV1_registration_record",
+        @"sec_identity_copy_SPAKE2PLUSV1_client_password_verifier",
+        @"sec_identity_copy_SPAKE2PLUSV1_server_password_verifier",
+        @"sec_protocol_options_set_pake_challenge_block",
+        @"sec_protocol_metadata_get_tls_pake_offered",
+        @"sec_protocol_metadata_get_tls_negotiated_pake",
+    ];
+    for (NSString *symbol in symbols) {
+        printf("%-60s %p\n", symbol.UTF8String, dlsym(RTLD_DEFAULT, symbol.UTF8String));
+    }
+
+    Class offeredClass = NSClassFromString(@"SecOfferedPAKEIdentity");
+    printf("SecOfferedPAKEIdentity class: %s\n", offeredClass ? class_getName(offeredClass) : "nil");
+    if (!offeredClass) {
+        return;
+    }
+    PrintMethods(offeredClass, NO, NO, nil);
+    id allocated = ((id (*)(id, SEL))objc_msgSend)(offeredClass, @selector(alloc));
+    SEL initSelector = NSSelectorFromString(@"initWithClientIdentity:::");
+    id offered = ((id (*)(id, SEL, id, id, unsigned short))objc_msgSend)(
+        allocated,
+        initSelector,
+        clientIdentity ?: @"",
+        serverIdentity ?: @"",
+        scheme);
+    id client = ((id (*)(id, SEL))objc_msgSend)(offered, NSSelectorFromString(@"client_identity"));
+    id server = ((id (*)(id, SEL))objc_msgSend)(offered, NSSelectorFromString(@"server_identity"));
+    unsigned short actualScheme =
+        ((unsigned short (*)(id, SEL))objc_msgSend)(offered, NSSelectorFromString(@"pake_scheme"));
+    printf("offered: %s client=%s server=%s scheme=%u\n",
+           [[offered description] UTF8String],
+           [SafeString(client) UTF8String],
+           [SafeString(server) UTF8String],
+           actualScheme);
+    PrintCFObjectShape((__bridge CFTypeRef)offered, "offered");
+}
+
+static dispatch_data_t DispatchDataFromNSData(NSData *data) {
+    if (!data) {
+        return nil;
+    }
+    void *buffer = malloc(data.length);
+    if (!buffer && data.length > 0) {
+        return nil;
+    }
+    if (data.length > 0) {
+        memcpy(buffer, data.bytes, data.length);
+    }
+    return dispatch_data_create(buffer, data.length, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), DISPATCH_DATA_DESTRUCTOR_FREE);
+}
+
+static void PrintDispatchDataObject(id object, const char *label) {
+    if (!object) {
+        printf("%s: nil\n", label);
+        return;
+    }
+
+    const char *className = object_getClassName(object);
+    printf("%s: class=%s desc=%s\n",
+           label,
+           className ? className : "(unknown)",
+           [[object description] UTF8String]);
+
+    if (![object conformsToProtocol:@protocol(OS_dispatch_data)]) {
+        return;
+    }
+
+    dispatch_data_t data = (dispatch_data_t)object;
+    size_t size = dispatch_data_get_size(data);
+    const void *buffer = NULL;
+    size_t mappedSize = 0;
+    dispatch_data_t mapped = dispatch_data_create_map(data, &buffer, &mappedSize);
+    NSData *bytes = buffer && mappedSize > 0 ? [NSData dataWithBytes:buffer length:mappedSize] : [NSData data];
+    printf("%s: dispatch_len=%zu hex=%s\n", label, size, HexString(bytes, 256).UTF8String);
+    (void)mapped;
+}
+
+static void PrintSPAKEIdentityFields(id identity) {
+    NSArray<NSString *> *symbols = @[
+        @"sec_identity_copy_SPAKE2PLUSV1_context",
+        @"sec_identity_copy_SPAKE2PLUSV1_client_identity",
+        @"sec_identity_copy_SPAKE2PLUSV1_server_identity",
+        @"sec_identity_copy_SPAKE2PLUSV1_client_password_verifier",
+        @"sec_identity_copy_SPAKE2PLUSV1_server_password_verifier",
+        @"sec_identity_copy_SPAKE2PLUSV1_registration_record",
+    ];
+    for (NSString *symbol in symbols) {
+        id (*copyFn)(id) = (id (*)(id))dlsym(RTLD_DEFAULT, symbol.UTF8String);
+        if (!copyFn) {
+            printf("%s unavailable\n", symbol.UTF8String);
+            continue;
+        }
+        id value = copyFn(identity);
+        PrintDispatchDataObject(value, symbol.UTF8String);
+    }
+}
+
+static void CreateClientSPAKEIdentity(NSString *contextArg,
+                                      NSString *clientIdentityArg,
+                                      NSString *serverIdentityArg,
+                                      NSString *passwordArg) {
+    LoadContinuityFrameworks();
+
+    void *security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW | RTLD_LOCAL);
+    printf("Security handle: %p\n", security);
+
+    typedef id (*CreateClientFn)(id, dispatch_data_t, dispatch_data_t, dispatch_data_t, int);
+    CreateClientFn createClient = (CreateClientFn)dlsym(RTLD_DEFAULT, "sec_identity_create_client_SPAKE2PLUSV1_identity");
+    if (!createClient) {
+        puts("sec_identity_create_client_SPAKE2PLUSV1_identity unavailable");
+        return;
+    }
+
+    NSData *contextBytes = DataFromProbeArgument(contextArg ?: @"");
+    NSData *clientIdentityBytes = DataFromProbeArgument(clientIdentityArg ?: @"");
+    NSData *serverIdentityBytes = DataFromProbeArgument(serverIdentityArg ?: @"");
+    NSData *passwordBytes = DataFromProbeArgument(passwordArg ?: @"");
+
+    dispatch_data_t contextData = DispatchDataFromNSData(contextBytes);
+    dispatch_data_t clientIdentityData = DispatchDataFromNSData(clientIdentityBytes);
+    dispatch_data_t serverIdentityData = DispatchDataFromNSData(serverIdentityBytes);
+    dispatch_data_t passwordData = DispatchDataFromNSData(passwordBytes);
+
+    PrintDispatchDataObject(contextData, "input.context");
+    PrintDispatchDataObject(clientIdentityData, "input.client_identity");
+    PrintDispatchDataObject(serverIdentityData, "input.server_identity");
+    PrintDispatchDataObject(passwordData, "input.password");
+
+    id identity = createClient(contextData, clientIdentityData, serverIdentityData, passwordData, 0);
+    printf("client_identity_object: %s\n", identity ? [[identity description] UTF8String] : "nil");
+    PrintSPAKEIdentityFields(identity);
+}
+
+static void CreateServerSPAKEIdentity(NSString *contextArg,
+                                      NSString *clientIdentityArg,
+                                      NSString *serverIdentityArg,
+                                      NSString *serverPasswordVerifierArg,
+                                      NSString *registrationRecordArg) {
+    LoadContinuityFrameworks();
+
+    void *security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW | RTLD_LOCAL);
+    printf("Security handle: %p\n", security);
+
+    typedef id (*CreateServerFn)(id, id, id, dispatch_data_t, dispatch_data_t);
+    CreateServerFn createServer = (CreateServerFn)dlsym(RTLD_DEFAULT, "sec_identity_create_server_SPAKE2PLUSV1_identity");
+    if (!createServer) {
+        puts("sec_identity_create_server_SPAKE2PLUSV1_identity unavailable");
+        return;
+    }
+
+    NSData *contextBytes = DataFromProbeArgument(contextArg ?: @"");
+    NSData *clientIdentityBytes = DataFromProbeArgument(clientIdentityArg ?: @"");
+    NSData *serverIdentityBytes = DataFromProbeArgument(serverIdentityArg ?: @"");
+    NSData *serverPasswordVerifierBytes = DataFromProbeArgument(serverPasswordVerifierArg ?: @"");
+    NSData *registrationRecordBytes = DataFromProbeArgument(registrationRecordArg ?: @"");
+
+    dispatch_data_t contextData = DispatchDataFromNSData(contextBytes);
+    dispatch_data_t clientIdentityData = DispatchDataFromNSData(clientIdentityBytes);
+    dispatch_data_t serverIdentityData = DispatchDataFromNSData(serverIdentityBytes);
+    dispatch_data_t serverPasswordVerifierData = DispatchDataFromNSData(serverPasswordVerifierBytes);
+    dispatch_data_t registrationRecordData = DispatchDataFromNSData(registrationRecordBytes);
+
+    PrintDispatchDataObject(contextData, "input.context");
+    PrintDispatchDataObject(clientIdentityData, "input.client_identity");
+    PrintDispatchDataObject(serverIdentityData, "input.server_identity");
+    PrintDispatchDataObject(serverPasswordVerifierData, "input.server_password_verifier");
+    PrintDispatchDataObject(registrationRecordData, "input.registration_record");
+
+    id identity = createServer(contextData,
+                               clientIdentityData,
+                               serverIdentityData,
+                               serverPasswordVerifierData,
+                               registrationRecordData);
+    printf("server_identity_object: %s\n", identity ? [[identity description] UTF8String] : "nil");
+    PrintSPAKEIdentityFields(identity);
+}
+
+static const char *NetworkBrowserStateName(nw_browser_state_t state) {
+    switch (state) {
+        case nw_browser_state_invalid: return "invalid";
+        case nw_browser_state_ready: return "ready";
+        case nw_browser_state_failed: return "failed";
+        case nw_browser_state_cancelled: return "cancelled";
+        case nw_browser_state_waiting: return "waiting";
+        default: return "unknown";
+    }
+}
+
+static const char *NetworkListenerStateName(nw_listener_state_t state) {
+    switch (state) {
+        case nw_listener_state_invalid: return "invalid";
+        case nw_listener_state_waiting: return "waiting";
+        case nw_listener_state_ready: return "ready";
+        case nw_listener_state_failed: return "failed";
+        case nw_listener_state_cancelled: return "cancelled";
+        default: return "unknown";
+    }
+}
+
 static NSData *DataFromHexString(NSString *hex, NSError **errorOut) {
     NSMutableString *cleaned = [NSMutableString stringWithCapacity:hex.length];
     NSCharacterSet *skip = [NSCharacterSet characterSetWithCharactersInString:@" \n\r\t:-"];
@@ -372,6 +670,32 @@ static NSData *DataFromHexString(NSString *hex, NSError **errorOut) {
 
 static NSDictionary *LoadJSONDictionary(NSString *path);
 static id BuildPairedPeerFromJSON(NSDictionary *json);
+
+static id JSONValueFromArgument(NSString *argument) {
+    if (!argument || argument.length == 0 || [argument isEqualToString:@"-"]) {
+        return @{};
+    }
+
+    NSData *data = nil;
+    if ([argument hasPrefix:@"@"]) {
+        NSString *path = [argument substringFromIndex:1];
+        data = [NSData dataWithContentsOfFile:path];
+        if (!data) {
+            fprintf(stderr, "failed to read JSON argument file: %s\n", path.UTF8String);
+            return nil;
+        }
+    } else {
+        data = [argument dataUsingEncoding:NSUTF8StringEncoding];
+    }
+
+    NSError *error = nil;
+    id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    if (error) {
+        fprintf(stderr, "failed to parse JSON argument: %s\n", error.description.UTF8String);
+        return nil;
+    }
+    return object ?: @{};
+}
 
 static BOOL WaitForSemaphore(dispatch_semaphore_t sem, NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
@@ -614,6 +938,7 @@ static void ProbeRPPairingListen(NSTimeInterval seconds, BOOL uiVisible) {
     typedef void (*VoidFn)(id, SEL);
     VoidFn start = (VoidFn)[controller methodForSelector:startSelector];
     start(controller, startSelector);
+    PrintPairingControllerXPCState(controller, "pairing");
     if (setVisible) {
         setVisible(controller, setVisibleSelector, uiVisible);
     }
@@ -881,6 +1206,7 @@ static id BuildRPIdentityFromPeerJSON(NSString *jsonPath, int type) {
     if (!json) {
         return nil;
     }
+    NSString *identifier = [json[@"identifier"] isKindOfClass:[NSString class]] ? json[@"identifier"] : nil;
     id peer = BuildPairedPeerFromJSON(json);
     if (!peer) {
         return nil;
@@ -899,7 +1225,31 @@ static id BuildRPIdentityFromPeerJSON(NSString *jsonPath, int type) {
     }
     typedef id (*InitFn)(id, SEL, id, int);
     InitFn initFn = (InitFn)[identity methodForSelector:initSelector];
-    return initFn(identity, initSelector, peer, type);
+    identity = initFn(identity, initSelector, peer, type);
+    if (identifier.length > 0) {
+        if ([identity respondsToSelector:@selector(setIdentifier:)]) {
+            [identity setValue:identifier forKey:@"identifier"];
+        }
+        if ([identity respondsToSelector:@selector(setIdsDeviceID:)]) {
+            [identity setValue:identifier forKey:@"idsDeviceID"];
+        }
+        if ([identity respondsToSelector:@selector(setMediaRemoteID:)]) {
+            [identity setValue:identifier forKey:@"mediaRemoteID"];
+        }
+    }
+    if ([identity respondsToSelector:@selector(setDateAdded:)]) {
+        [identity setValue:[NSDate date] forKey:@"dateAdded"];
+    }
+    if ([identity respondsToSelector:@selector(setDateAcknowledged:)]) {
+        [identity setValue:[NSDate date] forKey:@"dateAcknowledged"];
+    }
+    if ([identity respondsToSelector:@selector(setPresent:)]) {
+        [identity setValue:@YES forKey:@"present"];
+    }
+    if ([identity respondsToSelector:@selector(setUserAdded:)]) {
+        [identity setValue:@YES forKey:@"userAdded"];
+    }
+    return identity;
 }
 
 static id NewRPClient(void) {
@@ -956,7 +1306,7 @@ static void TryRPClientListIdentities(uint32_t flags) {
     }
 }
 
-static void TryRPClientAddIdentity(NSString *jsonPath, int type, int source) {
+static void TryRPClientAddIdentity(NSString *jsonPath, int type, int source, BOOL withSource) {
     LoadContinuityFrameworks();
 
     id identity = BuildRPIdentityFromPeerJSON(jsonPath, type);
@@ -972,26 +1322,815 @@ static void TryRPClientAddIdentity(NSString *jsonPath, int type, int source) {
         return;
     }
 
-    SEL selector = @selector(addOrUpdateIdentity:source:completion:);
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    if (withSource) {
+        SEL selector = @selector(addOrUpdateIdentity:source:completion:);
+        if (![client respondsToSelector:selector]) {
+            puts("addOrUpdateIdentity:source:completion: unavailable");
+            return;
+        }
+
+        typedef void (*AddIdentityFn)(id, SEL, id, int, void (^)(NSError *));
+        AddIdentityFn addIdentity = (AddIdentityFn)[client methodForSelector:selector];
+        addIdentity(client, selector, identity, source, ^(NSError *error) {
+            if (error) {
+                printf("addOrUpdateIdentity:source error: %s\n", error.description.UTF8String);
+            } else {
+                puts("addOrUpdateIdentity:source completed without error");
+            }
+            dispatch_semaphore_signal(sem);
+        });
+    } else {
+        SEL selector = @selector(addOrUpdateIdentity:completion:);
+        if (![client respondsToSelector:selector]) {
+            puts("addOrUpdateIdentity:completion: unavailable");
+            return;
+        }
+
+        typedef void (*AddIdentityNoSourceFn)(id, SEL, id, void (^)(NSError *));
+        AddIdentityNoSourceFn addIdentity = (AddIdentityNoSourceFn)[client methodForSelector:selector];
+        addIdentity(client, selector, identity, ^(NSError *error) {
+            if (error) {
+                printf("addOrUpdateIdentity error: %s\n", error.description.UTF8String);
+            } else {
+                puts("addOrUpdateIdentity completed without error");
+            }
+            dispatch_semaphore_signal(sem);
+        });
+    }
+
+    if (!WaitForSemaphore(sem, 5.0)) {
+        puts("addOrUpdateIdentity timeout");
+    }
+}
+
+static void TryRPClientDiagnosticCommand(NSString *command, id params) {
+    LoadContinuityFrameworks();
+
+    id client = NewRPClient();
+    if (!client) {
+        fprintf(stderr, "RPClient not found\n");
+        return;
+    }
+
+    SEL selector = @selector(diagnosticCommand:params:completion:);
     if (![client respondsToSelector:selector]) {
-        puts("addOrUpdateIdentity:source:completion: unavailable");
+        puts("diagnosticCommand:params:completion: unavailable");
         return;
     }
 
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    typedef void (*AddIdentityFn)(id, SEL, id, int, void (^)(NSError *));
-    AddIdentityFn addIdentity = (AddIdentityFn)[client methodForSelector:selector];
-    addIdentity(client, selector, identity, source, ^(NSError *error) {
+    typedef void (*DiagnosticFn)(id, SEL, id, id, void (^)(id, NSError *));
+    DiagnosticFn diagnostic = (DiagnosticFn)[client methodForSelector:selector];
+    diagnostic(client, selector, command, params ?: @{}, ^(id result, NSError *error) {
         if (error) {
-            printf("addOrUpdateIdentity error: %s\n", error.description.UTF8String);
+            printf("diagnosticCommand error: %s\n", error.description.UTF8String);
         } else {
-            puts("addOrUpdateIdentity completed without error");
+            printf("diagnosticCommand result class=%s description=%s\n",
+                   result ? class_getName([result class]) : "nil",
+                   SafeString(result).UTF8String);
         }
         dispatch_semaphore_signal(sem);
     });
     if (!WaitForSemaphore(sem, 5.0)) {
-        puts("addOrUpdateIdentity timeout");
+        puts("diagnosticCommand timeout");
     }
+}
+
+static void TryRPClientEndpointMapping(NSString *applicationService, NSString *deviceID, NSString *endpointID) {
+    LoadContinuityFrameworks();
+
+    id client = NewRPClient();
+    if (!client) {
+        fprintf(stderr, "RPClient not found\n");
+        return;
+    }
+
+    SEL selector = @selector(createEndpointToDeviceMapping:deviceID:endpointID:completion:);
+    if (![client respondsToSelector:selector]) {
+        puts("createEndpointToDeviceMapping:deviceID:endpointID:completion: unavailable");
+        return;
+    }
+
+    printf("createEndpointToDeviceMapping applicationService=%s deviceID=%s endpointID=%s\n",
+           applicationService.UTF8String,
+           deviceID.UTF8String,
+           endpointID.UTF8String);
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    typedef void (*MappingFn)(id, SEL, id, id, id, void (^)(NSError *));
+    MappingFn createMapping = (MappingFn)[client methodForSelector:selector];
+    createMapping(client, selector, applicationService, deviceID, endpointID, ^(NSError *error) {
+        if (error) {
+            printf("createEndpointToDeviceMapping error: %s\n", error.description.UTF8String);
+        } else {
+            puts("createEndpointToDeviceMapping completed without error");
+        }
+        dispatch_semaphore_signal(sem);
+    });
+    if (!WaitForSemaphore(sem, 5.0)) {
+        puts("createEndpointToDeviceMapping timeout");
+    }
+}
+
+static void TryRPClientInternalDeviceMapping(int mappingType, NSString *applicationService, NSString *deviceID, NSString *endpointID) {
+    LoadContinuityFrameworks();
+
+    id client = NewRPClient();
+    if (!client) {
+        fprintf(stderr, "RPClient not found\n");
+        return;
+    }
+
+    SEL selector = @selector(clientCreateDeviceMappingInternal:applicationService:deviceID:endpointID:completion:);
+    if (![client respondsToSelector:selector]) {
+        puts("clientCreateDeviceMappingInternal:applicationService:deviceID:endpointID:completion: unavailable");
+        return;
+    }
+
+    printf("clientCreateDeviceMappingInternal type=%d applicationService=%s deviceID=%s endpointID=%s\n",
+           mappingType,
+           applicationService.UTF8String,
+           deviceID.UTF8String,
+           endpointID.UTF8String);
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    typedef void (*MappingFn)(id, SEL, int, id, id, id, void (^)(NSError *));
+    MappingFn createMapping = (MappingFn)[client methodForSelector:selector];
+    createMapping(client, selector, mappingType, applicationService, deviceID, endpointID, ^(NSError *error) {
+        if (error) {
+            printf("clientCreateDeviceMappingInternal error: %s\n", error.description.UTF8String);
+        } else {
+            puts("clientCreateDeviceMappingInternal completed without error");
+        }
+        dispatch_semaphore_signal(sem);
+    });
+    if (!WaitForSemaphore(sem, 5.0)) {
+        puts("clientCreateDeviceMappingInternal timeout");
+    }
+}
+
+static void TryRPClientDeviceToListenerMapping(NSString *listenerID, NSString *deviceID) {
+    LoadContinuityFrameworks();
+
+    id client = NewRPClient();
+    if (!client) {
+        fprintf(stderr, "RPClient not found\n");
+        return;
+    }
+
+    SEL selector = @selector(createDeviceToListenerMapping:deviceID:completion:);
+    if (![client respondsToSelector:selector]) {
+        puts("createDeviceToListenerMapping:deviceID:completion: unavailable");
+        return;
+    }
+
+    printf("createDeviceToListenerMapping listenerID=%s deviceID=%s\n",
+           listenerID.UTF8String,
+           deviceID.UTF8String);
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    typedef void (*MappingFn)(id, SEL, id, id, void (^)(NSError *));
+    MappingFn createMapping = (MappingFn)[client methodForSelector:selector];
+    createMapping(client, selector, listenerID, deviceID, ^(NSError *error) {
+        if (error) {
+            printf("createDeviceToListenerMapping error: %s\n", error.description.UTF8String);
+        } else {
+            puts("createDeviceToListenerMapping completed without error");
+        }
+        dispatch_semaphore_signal(sem);
+    });
+    if (!WaitForSemaphore(sem, 5.0)) {
+        puts("createDeviceToListenerMapping timeout");
+    }
+}
+
+static void TryRPClientQueryDeviceToListenerMapping(NSString *listenerID, NSString *deviceID) {
+    LoadContinuityFrameworks();
+
+    id client = NewRPClient();
+    if (!client) {
+        fprintf(stderr, "RPClient not found\n");
+        return;
+    }
+
+    SEL selector = @selector(queryDeviceToListenerMapping:deviceID:completion:);
+    if (![client respondsToSelector:selector]) {
+        puts("queryDeviceToListenerMapping:deviceID:completion: unavailable");
+        return;
+    }
+
+    printf("queryDeviceToListenerMapping listenerID=%s deviceID=%s\n",
+           listenerID.UTF8String,
+           deviceID.UTF8String);
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    typedef void (*QueryFn)(id, SEL, id, id, void (^)(id, NSError *));
+    QueryFn queryMapping = (QueryFn)[client methodForSelector:selector];
+    queryMapping(client, selector, listenerID, deviceID, ^(id result, NSError *error) {
+        if (error) {
+            printf("queryDeviceToListenerMapping error: %s\n", error.description.UTF8String);
+        } else {
+            printf("queryDeviceToListenerMapping result: class=%s value=%s\n",
+                   result ? class_getName([result class]) : "nil",
+                   RedactedLength(result).UTF8String);
+        }
+        dispatch_semaphore_signal(sem);
+    });
+    if (!WaitForSemaphore(sem, 5.0)) {
+        puts("queryDeviceToListenerMapping timeout");
+    }
+}
+
+static void TryRPClientSetAutoMapping(BOOL enabled) {
+    LoadContinuityFrameworks();
+
+    id client = NewRPClient();
+    if (!client) {
+        fprintf(stderr, "RPClient not found\n");
+        return;
+    }
+
+    SEL selector = @selector(setAutoMapping:completion:);
+    if (![client respondsToSelector:selector]) {
+        puts("setAutoMapping:completion: unavailable");
+        return;
+    }
+
+    printf("setAutoMapping enabled=%s\n", enabled ? "yes" : "no");
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    typedef void (*AutoMappingFn)(id, SEL, BOOL, void (^)(NSError *));
+    AutoMappingFn setAutoMapping = (AutoMappingFn)[client methodForSelector:selector];
+    setAutoMapping(client, selector, enabled, ^(NSError *error) {
+        if (error) {
+            printf("setAutoMapping error: %s\n", error.description.UTF8String);
+        } else {
+            puts("setAutoMapping completed without error");
+        }
+        dispatch_semaphore_signal(sem);
+    });
+    if (!WaitForSemaphore(sem, 5.0)) {
+        puts("setAutoMapping timeout");
+    }
+}
+
+static void PrintCompanionLinkDeviceSummary(const char *label, id device, uint32_t changes) {
+    if (!device) {
+        printf("%s device=nil changes=0x%x\n", label, changes);
+        return;
+    }
+
+    id identifier = SafeValueForKey(device, @"identifier");
+    id idsIdentifier = SafeValueForKey(device, @"idsDeviceIdentifier");
+    id idsPersonalIdentifier = SafeValueForKey(device, @"idsPersonalDeviceIdentifier");
+    id name = SafeValueForKey(device, @"name");
+    id model = SafeValueForKey(device, @"model");
+    id modelIdentifier = SafeValueForKey(device, @"modelIdentifier");
+    id effectiveIdentifier = SafeValueForKey(device, @"effectiveIdentifier");
+    id publicIdentifier = SafeValueForKey(device, @"publicIdentifier");
+    id pairingIdentifier = SafeValueForKey(device, @"pairingIdentifier");
+
+    printf("%s class=%s changes=0x%x\n", label, class_getName([device class]), changes);
+    printf("  description: %s\n", SafeString(device).UTF8String);
+    printf("  identifier: %s\n", DescribeString(identifier).UTF8String);
+    printf("  effectiveIdentifier: %s\n", DescribeString(effectiveIdentifier).UTF8String);
+    printf("  publicIdentifier: %s\n", DescribeString(publicIdentifier).UTF8String);
+    printf("  pairingIdentifier: %s\n", DescribeString(pairingIdentifier).UTF8String);
+    printf("  idsDeviceIdentifier: %s\n", DescribeString(idsIdentifier).UTF8String);
+    printf("  idsPersonalDeviceIdentifier: %s\n", DescribeString(idsPersonalIdentifier).UTF8String);
+    printf("  name: %s\n", DescribeString(name).UTF8String);
+    printf("  model: %s\n", DescribeString(model).UTF8String);
+    printf("  modelIdentifier: %s\n", DescribeString(modelIdentifier).UTF8String);
+
+    BOOL personal = NO;
+    if (ReadBoolSelector(device, @selector(isPersonal), &personal)) {
+        printf("  personal: %s\n", personal ? "yes" : "no");
+    }
+
+    if ([device respondsToSelector:@selector(flags)]) {
+        typedef uint32_t (*UIntGetterFn)(id, SEL);
+        UIntGetterFn flagsFn = (UIntGetterFn)[device methodForSelector:@selector(flags)];
+        printf("  flags: 0x%x\n", flagsFn(device, @selector(flags)));
+    }
+    if ([device respondsToSelector:@selector(deviceCapabilityFlags)]) {
+        typedef uint32_t (*UIntGetterFn)(id, SEL);
+        UIntGetterFn flagsFn = (UIntGetterFn)[device methodForSelector:@selector(deviceCapabilityFlags)];
+        printf("  deviceCapabilityFlags: 0x%x\n", flagsFn(device, @selector(deviceCapabilityFlags)));
+    }
+    if ([device respondsToSelector:@selector(statusFlags)]) {
+        typedef uint64_t (*UInt64GetterFn)(id, SEL);
+        UInt64GetterFn flagsFn = (UInt64GetterFn)[device methodForSelector:@selector(statusFlags)];
+        printf("  statusFlags: 0x%llx\n", (unsigned long long)flagsFn(device, @selector(statusFlags)));
+    }
+}
+
+static id CopyObjectProperty(id object, SEL selector) {
+    if (!object || ![object respondsToSelector:selector]) {
+        return nil;
+    }
+    typedef id (*GetterFn)(id, SEL);
+    GetterFn fn = (GetterFn)[object methodForSelector:selector];
+    return fn ? fn(object, selector) : nil;
+}
+
+static void PrintPairingControllerXPCState(id controller, const char *label) {
+    id connection = nil;
+    @try {
+        connection = [controller valueForKey:@"xpcCnx"];
+    } @catch (__unused NSException *exception) {
+        connection = nil;
+    }
+
+    printf("%s.xpcCnx.class=%s description=%s\n",
+           label,
+           connection ? class_getName([connection class]) : "nil",
+           connection ? SafeString(connection).UTF8String : "nil");
+    if (!connection) {
+        return;
+    }
+
+    id serviceName = CopyObjectProperty(connection, @selector(serviceName));
+    printf("%s.xpcCnx.serviceName=%s\n",
+           label,
+           serviceName ? SafeString(serviceName).UTF8String : "nil");
+
+    id remoteInterface = CopyObjectProperty(connection, @selector(remoteObjectInterface));
+    printf("%s.xpcCnx.remoteObjectInterface=%s\n",
+           label,
+           remoteInterface ? SafeString(remoteInterface).UTF8String : "nil");
+
+    id exportedInterface = CopyObjectProperty(connection, @selector(exportedInterface));
+    printf("%s.xpcCnx.exportedInterface=%s\n",
+           label,
+           exportedInterface ? SafeString(exportedInterface).UTF8String : "nil");
+
+    id exportedObject = CopyObjectProperty(connection, @selector(exportedObject));
+    printf("%s.xpcCnx.exportedObject=%s\n",
+           label,
+           exportedObject ? SafeString(exportedObject).UTF8String : "nil");
+
+    id endpoint = CopyObjectProperty(connection, @selector(endpoint));
+    printf("%s.xpcCnx.endpoint=%s\n",
+           label,
+           endpoint ? SafeString(endpoint).UTF8String : "nil");
+}
+
+static void TryRPCompanionLinkBrowse(NSString *serviceType,
+                                     NSTimeInterval seconds,
+                                     uint32_t flags,
+                                     uint64_t controlFlags,
+                                     uint32_t useCase) {
+    LoadContinuityFrameworks();
+
+    Class clientClass = NSClassFromString(@"RPCompanionLinkClient");
+    if (!clientClass) {
+        fprintf(stderr, "RPCompanionLinkClient not found\n");
+        return;
+    }
+
+    id client = [[clientClass alloc] init];
+    if (!client) {
+        fprintf(stderr, "failed to allocate RPCompanionLinkClient\n");
+        return;
+    }
+
+    if ([client respondsToSelector:@selector(setDispatchQueue:)]) {
+        typedef void (*SetQueueFn)(id, SEL, dispatch_queue_t);
+        SetQueueFn fn = (SetQueueFn)[client methodForSelector:@selector(setDispatchQueue:)];
+        fn(client, @selector(setDispatchQueue:), dispatch_get_main_queue());
+    }
+    if ([client respondsToSelector:@selector(setTargetUserSession:)]) {
+        typedef void (*SetBoolFn)(id, SEL, BOOL);
+        SetBoolFn fn = (SetBoolFn)[client methodForSelector:@selector(setTargetUserSession:)];
+        fn(client, @selector(setTargetUserSession:), YES);
+    }
+    if ([client respondsToSelector:@selector(setAppID:)]) {
+        typedef void (*SetObjectFn)(id, SEL, id);
+        SetObjectFn fn = (SetObjectFn)[client methodForSelector:@selector(setAppID:)];
+        fn(client, @selector(setAppID:), serviceType);
+    }
+    if ([client respondsToSelector:@selector(setServiceType:)]) {
+        typedef void (*SetObjectFn)(id, SEL, id);
+        SetObjectFn fn = (SetObjectFn)[client methodForSelector:@selector(setServiceType:)];
+        fn(client, @selector(setServiceType:), serviceType);
+    }
+    if ([client respondsToSelector:@selector(setFlags:)]) {
+        typedef void (*SetUIntFn)(id, SEL, uint32_t);
+        SetUIntFn fn = (SetUIntFn)[client methodForSelector:@selector(setFlags:)];
+        fn(client, @selector(setFlags:), flags);
+    }
+    if ([client respondsToSelector:@selector(setControlFlags:)]) {
+        typedef void (*SetUInt64Fn)(id, SEL, uint64_t);
+        SetUInt64Fn fn = (SetUInt64Fn)[client methodForSelector:@selector(setControlFlags:)];
+        fn(client, @selector(setControlFlags:), controlFlags);
+    }
+    if ([client respondsToSelector:@selector(setUseCase:)]) {
+        typedef void (*SetUIntFn)(id, SEL, uint32_t);
+        SetUIntFn fn = (SetUIntFn)[client methodForSelector:@selector(setUseCase:)];
+        fn(client, @selector(setUseCase:), useCase);
+    }
+
+    __block NSUInteger eventCount = 0;
+    if ([client respondsToSelector:@selector(setDeviceFoundHandler:)]) {
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[client methodForSelector:@selector(setDeviceFoundHandler:)];
+        fn(client, @selector(setDeviceFoundHandler:), ^(id device) {
+            eventCount++;
+            PrintCompanionLinkDeviceSummary("device found", device, 0);
+        });
+    }
+    if ([client respondsToSelector:@selector(setDeviceLostHandler:)]) {
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[client methodForSelector:@selector(setDeviceLostHandler:)];
+        fn(client, @selector(setDeviceLostHandler:), ^(id device) {
+            eventCount++;
+            PrintCompanionLinkDeviceSummary("device lost", device, 0);
+        });
+    }
+    if ([client respondsToSelector:@selector(setDeviceChangedHandler:)]) {
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[client methodForSelector:@selector(setDeviceChangedHandler:)];
+        fn(client, @selector(setDeviceChangedHandler:), ^(id device, uint32_t changes) {
+            eventCount++;
+            PrintCompanionLinkDeviceSummary("device changed", device, changes);
+        });
+    }
+    if ([client respondsToSelector:@selector(setLocalDeviceUpdatedHandler:)]) {
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[client methodForSelector:@selector(setLocalDeviceUpdatedHandler:)];
+        fn(client, @selector(setLocalDeviceUpdatedHandler:), ^(id device) {
+            PrintCompanionLinkDeviceSummary("local device updated", device, 0);
+        });
+    }
+    if ([client respondsToSelector:@selector(setInterruptionHandler:)]) {
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[client methodForSelector:@selector(setInterruptionHandler:)];
+        fn(client, @selector(setInterruptionHandler:), ^{
+            puts("RPCompanionLinkClient interrupted");
+        });
+    }
+    if ([client respondsToSelector:@selector(setInvalidationHandler:)]) {
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[client methodForSelector:@selector(setInvalidationHandler:)];
+        fn(client, @selector(setInvalidationHandler:), ^{
+            puts("RPCompanionLinkClient invalidated");
+        });
+    }
+    if ([client respondsToSelector:@selector(setDisconnectHandler:)]) {
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[client methodForSelector:@selector(setDisconnectHandler:)];
+        fn(client, @selector(setDisconnectHandler:), ^{
+            puts("RPCompanionLinkClient disconnected");
+        });
+    }
+
+    printf("activating RPCompanionLinkClient serviceType=%s seconds=%.1f flags=0x%x controlFlags=0x%llx useCase=0x%x\n",
+           serviceType.UTF8String,
+           seconds,
+           flags,
+           (unsigned long long)controlFlags,
+           useCase);
+
+    dispatch_semaphore_t activationSem = dispatch_semaphore_create(0);
+    if ([client respondsToSelector:@selector(activateWithCompletion:)]) {
+        typedef void (*ActivateFn)(id, SEL, void (^)(NSError *));
+        ActivateFn activate = (ActivateFn)[client methodForSelector:@selector(activateWithCompletion:)];
+        activate(client, @selector(activateWithCompletion:), ^(NSError *error) {
+            if (error) {
+                printf("RPCompanionLinkClient activation error: %s\n", error.description.UTF8String);
+            } else {
+                puts("RPCompanionLinkClient activated");
+            }
+            dispatch_semaphore_signal(activationSem);
+        });
+    } else {
+        puts("activateWithCompletion: unavailable");
+        return;
+    }
+
+    WaitForSemaphore(activationSem, 5.0);
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+
+    if ([client respondsToSelector:@selector(activeDevices)]) {
+        NSArray *devices = [client valueForKey:@"activeDevices"];
+        printf("activeDevices: %lu\n", (unsigned long)devices.count);
+        NSUInteger index = 0;
+        for (id device in devices) {
+            char label[64];
+            snprintf(label, sizeof(label), "active device %lu", (unsigned long)index++);
+            PrintCompanionLinkDeviceSummary(label, device, 0);
+        }
+    }
+    printf("events: %lu\n", (unsigned long)eventCount);
+
+    if ([client respondsToSelector:@selector(invalidate)]) {
+        typedef void (*VoidFn)(id, SEL);
+        VoidFn invalidate = (VoidFn)[client methodForSelector:@selector(invalidate)];
+        invalidate(client, @selector(invalidate));
+    }
+}
+
+static void DumpNetworkApplicationServiceDescriptors(NSString *serviceName) {
+    LoadContinuityFrameworks();
+
+    nw_browse_descriptor_t browseDescriptor =
+        nw_browse_descriptor_create_application_service(serviceName.UTF8String);
+    nw_advertise_descriptor_t advertiseDescriptor =
+        nw_advertise_descriptor_create_application_service(serviceName.UTF8String);
+
+    printf("application service=%s\n", serviceName.UTF8String);
+    printf("nw_browse_descriptor=%s\n", browseDescriptor ? [[(id)browseDescriptor description] UTF8String] : "nil");
+    printf("nw_advertise_descriptor=%s\n", advertiseDescriptor ? [[(id)advertiseDescriptor description] UTF8String] : "nil");
+
+    Class browseWrapperClass = NSClassFromString(@"NWBrowseDescriptor");
+    SEL wrapBrowseSelector = @selector(descriptorWithInternalDescriptor:);
+    id browseWrapper = nil;
+    if (browseDescriptor && [browseWrapperClass respondsToSelector:wrapBrowseSelector]) {
+        typedef id (*WrapBrowseFn)(id, SEL, id);
+        WrapBrowseFn wrap = (WrapBrowseFn)[browseWrapperClass methodForSelector:wrapBrowseSelector];
+        browseWrapper = wrap(browseWrapperClass, wrapBrowseSelector, (id)browseDescriptor);
+    }
+
+    if (browseWrapper) {
+        printf("NWBrowseDescriptor class=%s description=%s\n",
+               class_getName([browseWrapper class]),
+               [[browseWrapper description] UTF8String]);
+        if ([browseWrapper respondsToSelector:@selector(encodedData)]) {
+            typedef id (*EncodedFn)(id, SEL);
+            EncodedFn encoded = (EncodedFn)[browseWrapper methodForSelector:@selector(encodedData)];
+            NSData *data = encoded(browseWrapper, @selector(encodedData));
+            printf("NWBrowseDescriptor encodedData=%s hex=%s\n",
+                   DescribeData(data).UTF8String,
+                   HexString(data, 256).UTF8String);
+
+            SEL protocolBufferSelector = @selector(descriptorWithProtocolBufferData:);
+            if (data && [browseWrapperClass respondsToSelector:protocolBufferSelector]) {
+                typedef id (*PBWrapFn)(id, SEL, id);
+                PBWrapFn fromPB = (PBWrapFn)[browseWrapperClass methodForSelector:protocolBufferSelector];
+                id decoded = fromPB(browseWrapperClass, protocolBufferSelector, data);
+                printf("NWBrowseDescriptor decodedFromPB class=%s description=%s\n",
+                       decoded ? class_getName([decoded class]) : "nil",
+                       decoded ? [[decoded description] UTF8String] : "nil");
+            }
+
+            Class pbClass = NSClassFromString(@"NWPBBrowseDescriptor");
+            if (data && pbClass) {
+                id pb = [[pbClass alloc] init];
+                if ([pb respondsToSelector:@selector(readFrom:)]) {
+                    typedef BOOL (*ReadFn)(id, SEL, id);
+                    ReadFn read = (ReadFn)[pb methodForSelector:@selector(readFrom:)];
+                    BOOL ok = read(pb, @selector(readFrom:), data);
+                    printf("NWPBBrowseDescriptor read=%s description=%s\n",
+                           ok ? "yes" : "no",
+                           [[pb description] UTF8String]);
+                    Ivar serviceIvar = class_getInstanceVariable(pbClass, "_service");
+                    id service = serviceIvar ? object_getIvar(pb, serviceIvar) : nil;
+                    printf("NWPBBrowseDescriptor service=%s\n",
+                           service ? [[service description] UTF8String] : "nil");
+                }
+            }
+        }
+    } else {
+        puts("NWBrowseDescriptor wrapper unavailable");
+    }
+
+    Class advertiseWrapperClass = NSClassFromString(@"NWAdvertiseDescriptor");
+    id advertiseWrapper = nil;
+    if (advertiseDescriptor && advertiseWrapperClass) {
+        SEL initSelector = @selector(initWithDescriptor:);
+        if ([advertiseWrapperClass instancesRespondToSelector:initSelector]) {
+            typedef id (*InitAdvertiseFn)(id, SEL, id);
+            id allocated = [advertiseWrapperClass alloc];
+            InitAdvertiseFn init = (InitAdvertiseFn)[allocated methodForSelector:initSelector];
+            advertiseWrapper = init(allocated, initSelector, (id)advertiseDescriptor);
+        }
+    }
+
+    if (advertiseWrapper) {
+        printf("NWAdvertiseDescriptor class=%s description=%s\n",
+               class_getName([advertiseWrapper class]),
+               [[advertiseWrapper description] UTF8String]);
+    } else {
+        puts("NWAdvertiseDescriptor wrapper unavailable");
+    }
+}
+
+static nw_browse_descriptor_t CreateApplicationServiceBrowseDescriptor(NSString *serviceName, NSString *bundleID) {
+    if (bundleID.length > 0) {
+        typedef nw_browse_descriptor_t (*CreateWithBundleFn)(const char *, const char *);
+        CreateWithBundleFn createWithBundle = (CreateWithBundleFn)dlsym(RTLD_DEFAULT, "nw_browse_descriptor_create_application_service_with_bundle_id");
+        if (createWithBundle) {
+            return createWithBundle(serviceName.UTF8String, bundleID.UTF8String);
+        }
+        puts("nw_browse_descriptor_create_application_service_with_bundle_id unavailable; using public constructor");
+    }
+    return nw_browse_descriptor_create_application_service(serviceName.UTF8String);
+}
+
+static nw_advertise_descriptor_t CreateApplicationServiceAdvertiseDescriptor(NSString *serviceName, NSString *bundleID) {
+    if (bundleID.length > 0) {
+        typedef nw_advertise_descriptor_t (*CreateWithBundleFn)(const char *, const char *);
+        CreateWithBundleFn createWithBundle = (CreateWithBundleFn)dlsym(RTLD_DEFAULT, "nw_advertise_descriptor_create_application_service_with_bundle_id");
+        if (createWithBundle) {
+            return createWithBundle(serviceName.UTF8String, bundleID.UTF8String);
+        }
+        puts("nw_advertise_descriptor_create_application_service_with_bundle_id unavailable; using public constructor");
+    }
+    return nw_advertise_descriptor_create_application_service(serviceName.UTF8String);
+}
+
+static NSData *DataFromProbeArgument(NSString *argument) {
+    if (argument.length == 0) {
+        return nil;
+    }
+    if ([argument hasPrefix:@"@"]) {
+        NSString *path = [argument substringFromIndex:1];
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) {
+            fprintf(stderr, "failed to read data file: %s\n", path.UTF8String);
+        }
+        return data;
+    }
+    if ([argument hasPrefix:@"hex:"]) {
+        NSError *error = nil;
+        NSData *data = DataFromHexString([argument substringFromIndex:4], &error);
+        if (!data) {
+            fprintf(stderr, "invalid hex data: %s\n", error.description.UTF8String);
+        }
+        return data;
+    }
+    if ([argument hasPrefix:@"json:"]) {
+        return [[argument substringFromIndex:5] dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    return [argument dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+static NSData *JSONDataFromObject(id object) {
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:object options:0 error:&error];
+    if (!data) {
+        fprintf(stderr, "failed to encode JSON data: %s\n", error.description.UTF8String);
+    }
+    return data;
+}
+
+static NSData *ListenerPinPairingCustomService(NSString *pin) {
+    return JSONDataFromObject(@{
+        @"pairingValue": @{@"pin": @{@"_0": pin.length > 0 ? pin : @"123456"}},
+        @"supportedPairingTypes": @[@{@"pin": @{}}],
+        @"generatePairingValueImmediately": @YES,
+        @"_advertiseSensitiveInfo": @YES,
+    });
+}
+
+static NSData *BrowserPinPairingCustomService(void) {
+    return JSONDataFromObject(@{
+        @"pairingType": @{@"pin": @{}},
+        @"preferredPairingTypes": @[@{@"pin": @{}}],
+    });
+}
+
+static BOOL SetBrowseDescriptorCustomService(nw_browse_descriptor_t descriptor, NSData *customService) {
+    if (!customService) {
+        return YES;
+    }
+
+    typedef void (*SetCustomServiceFn)(nw_browse_descriptor_t, const void *, size_t);
+    SetCustomServiceFn setCustomService =
+        (SetCustomServiceFn)dlsym(RTLD_DEFAULT, "nw_browse_descriptor_set_custom_service");
+    if (!setCustomService) {
+        puts("nw_browse_descriptor_set_custom_service unavailable");
+        return NO;
+    }
+
+    setCustomService(descriptor, customService.bytes, customService.length);
+    printf("browse customService set: %s hex=%s\n",
+           DescribeData(customService).UTF8String,
+           HexString(customService, 128).UTF8String);
+    return YES;
+}
+
+static BOOL SetAdvertiseDescriptorCustomService(nw_advertise_descriptor_t descriptor, NSData *customService) {
+    if (!customService) {
+        return YES;
+    }
+
+    typedef void (*SetCustomServiceFn)(nw_advertise_descriptor_t, const void *, size_t);
+    SetCustomServiceFn setCustomService =
+        (SetCustomServiceFn)dlsym(RTLD_DEFAULT, "nw_advertise_descriptor_set_custom_service");
+    if (!setCustomService) {
+        puts("nw_advertise_descriptor_set_custom_service unavailable");
+        return NO;
+    }
+
+    setCustomService(descriptor, customService.bytes, customService.length);
+    printf("advertise customService set: %s hex=%s\n",
+           DescribeData(customService).UTF8String,
+           HexString(customService, 128).UTF8String);
+    return YES;
+}
+
+static void RunNetworkApplicationServiceBrowse(NSString *serviceName, NSString *bundleID, NSTimeInterval seconds, NSData *customService) {
+    LoadContinuityFrameworks();
+
+    nw_browse_descriptor_t descriptor = CreateApplicationServiceBrowseDescriptor(serviceName, bundleID);
+    if (!SetBrowseDescriptorCustomService(descriptor, customService)) {
+        return;
+    }
+    nw_parameters_t parameters = nw_parameters_create_application_service();
+    nw_browser_t browser = nw_browser_create(descriptor, parameters);
+    if (!browser) {
+        puts("nw_browser_create failed");
+        return;
+    }
+
+    printf("nw-appsvc-browse service=%s bundle=%s seconds=%.1f descriptor=%s\n",
+           serviceName.UTF8String,
+           bundleID.length > 0 ? bundleID.UTF8String : "(default)",
+           seconds,
+           [[(id)descriptor description] UTF8String]);
+
+    dispatch_queue_t queue = dispatch_queue_create("macolinux.nw-appsvc-browse", DISPATCH_QUEUE_SERIAL);
+    nw_browser_set_queue(browser, queue);
+    nw_browser_set_state_changed_handler(browser, ^(nw_browser_state_t state, nw_error_t error) {
+        printf("browser state=%s", NetworkBrowserStateName(state));
+        if (error) {
+            printf(" error=%s", [[(id)error description] UTF8String]);
+        }
+        puts("");
+    });
+    nw_browser_set_browse_results_changed_handler(browser, ^(nw_browse_result_t oldResult, nw_browse_result_t newResult, bool batchComplete) {
+        nw_browse_result_change_t changes = nw_browse_result_get_changes(oldResult, newResult);
+        nw_browse_result_t result = newResult ?: oldResult;
+        nw_endpoint_t endpoint = result ? nw_browse_result_copy_endpoint(result) : nil;
+        printf("browser result changes=0x%llx batchComplete=%s endpoint=%s\n",
+               (unsigned long long)changes,
+               batchComplete ? "yes" : "no",
+               endpoint ? [[(id)endpoint description] UTF8String] : "nil");
+    });
+    nw_browser_start(browser);
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+
+    nw_browser_cancel(browser);
+    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.3]];
+}
+
+static void RunNetworkApplicationServiceListen(NSString *serviceName, NSString *bundleID, NSTimeInterval seconds, NSData *customService) {
+    LoadContinuityFrameworks();
+
+    nw_advertise_descriptor_t descriptor = CreateApplicationServiceAdvertiseDescriptor(serviceName, bundleID);
+    if (!SetAdvertiseDescriptorCustomService(descriptor, customService)) {
+        return;
+    }
+    nw_parameters_t parameters = nw_parameters_create_application_service();
+    nw_listener_t listener = nw_listener_create(parameters);
+    if (!listener) {
+        puts("nw_listener_create failed");
+        return;
+    }
+    nw_listener_set_advertise_descriptor(listener, descriptor);
+
+    printf("nw-appsvc-listen service=%s bundle=%s seconds=%.1f descriptor=%s\n",
+           serviceName.UTF8String,
+           bundleID.length > 0 ? bundleID.UTF8String : "(default)",
+           seconds,
+           [[(id)descriptor description] UTF8String]);
+
+    dispatch_queue_t queue = dispatch_queue_create("macolinux.nw-appsvc-listen", DISPATCH_QUEUE_SERIAL);
+    nw_listener_set_queue(listener, queue);
+    nw_listener_set_state_changed_handler(listener, ^(nw_listener_state_t state, nw_error_t error) {
+        printf("listener state=%s", NetworkListenerStateName(state));
+        if (error) {
+            printf(" error=%s", [[(id)error description] UTF8String]);
+        }
+        puts("");
+    });
+    nw_listener_set_advertised_endpoint_changed_handler(listener, ^(nw_endpoint_t endpoint, bool added) {
+        printf("listener advertised %s endpoint=%s\n",
+               added ? "add" : "remove",
+               endpoint ? [[(id)endpoint description] UTF8String] : "nil");
+    });
+    nw_listener_set_new_connection_handler(listener, ^(nw_connection_t connection) {
+        printf("listener accepted connection=%s\n", [[(id)connection description] UTF8String]);
+        nw_connection_cancel(connection);
+    });
+    nw_listener_start(listener);
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+
+    nw_listener_cancel(listener);
+    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.3]];
 }
 
 static NSDictionary *LoadJSONDictionary(NSString *path) {
@@ -1236,6 +2375,138 @@ static void TryPairingSessionSavePeer(NSString *jsonPath, uint32_t sessionType, 
     }
 }
 
+static void ProbeRPServerListen(NSTimeInterval seconds, NSString *serviceType, int passwordType, uint32_t pairSetupFlags) {
+    LoadContinuityFrameworks();
+
+    Class serverClass = NSClassFromString(@"RPServer");
+    if (!serverClass) {
+        fprintf(stderr, "RPServer not found\n");
+        return;
+    }
+
+    id server = [[serverClass alloc] init];
+    if (!server) {
+        fprintf(stderr, "failed to create RPServer\n");
+        return;
+    }
+
+    SEL setQueueSelector = @selector(setDispatchQueue:);
+    if ([server respondsToSelector:setQueueSelector]) {
+        typedef void (*SetQueueFn)(id, SEL, dispatch_queue_t);
+        SetQueueFn fn = (SetQueueFn)[server methodForSelector:setQueueSelector];
+        fn(server, setQueueSelector, dispatch_get_main_queue());
+    }
+
+    SEL setLabelSelector = @selector(setLabel:);
+    if ([server respondsToSelector:setLabelSelector]) {
+        typedef void (*SetObjectFn)(id, SEL, id);
+        SetObjectFn fn = (SetObjectFn)[server methodForSelector:setLabelSelector];
+        fn(server, setLabelSelector, @"macolinux-rpserver-probe");
+    }
+
+    SEL setServiceTypeSelector = @selector(setServiceType:);
+    if (serviceType.length > 0 && [server respondsToSelector:setServiceTypeSelector]) {
+        typedef void (*SetObjectFn)(id, SEL, id);
+        SetObjectFn fn = (SetObjectFn)[server methodForSelector:setServiceTypeSelector];
+        fn(server, setServiceTypeSelector, serviceType);
+        printf("rpserver serviceType=%s\n", serviceType.UTF8String);
+    }
+
+    SEL setPasswordTypeSelector = @selector(setPasswordType:);
+    if ([server respondsToSelector:setPasswordTypeSelector]) {
+        typedef void (*SetIntFn)(id, SEL, int);
+        SetIntFn fn = (SetIntFn)[server methodForSelector:setPasswordTypeSelector];
+        fn(server, setPasswordTypeSelector, passwordType);
+        printf("rpserver passwordType=%d\n", passwordType);
+    }
+
+    SEL setPairSetupFlagsSelector = @selector(setPairSetupFlags:);
+    if ([server respondsToSelector:setPairSetupFlagsSelector]) {
+        typedef void (*SetUIntFn)(id, SEL, uint32_t);
+        SetUIntFn fn = (SetUIntFn)[server methodForSelector:setPairSetupFlagsSelector];
+        fn(server, setPairSetupFlagsSelector, pairSetupFlags);
+        printf("rpserver pairSetupFlags=0x%x\n", pairSetupFlags);
+    }
+
+    SEL setShowPasswordSelector = @selector(setShowPasswordHandler:);
+    if ([server respondsToSelector:setShowPasswordSelector]) {
+        id handler = ^(id password, unsigned int flags) {
+            printf("rpserver show password: %s flags=0x%x\n",
+                   RedactedLength(password).UTF8String,
+                   flags);
+        };
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[server methodForSelector:setShowPasswordSelector];
+        fn(server, setShowPasswordSelector, [handler copy]);
+    }
+
+    SEL setHidePasswordSelector = @selector(setHidePasswordHandler:);
+    if ([server respondsToSelector:setHidePasswordSelector]) {
+        id handler = ^(unsigned int flags) {
+            printf("rpserver hide password: flags=0x%x\n", flags);
+        };
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[server methodForSelector:setHidePasswordSelector];
+        fn(server, setHidePasswordSelector, [handler copy]);
+    }
+
+    SEL setPromptSelector = @selector(setPromptForPasswordHandler:);
+    if ([server respondsToSelector:setPromptSelector]) {
+        id handler = ^(int requestedPasswordType, unsigned int flags, int throttleSeconds) {
+            printf("rpserver prompt password: type=%d flags=0x%x throttle=%d\n",
+                   requestedPasswordType,
+                   flags,
+                   throttleSeconds);
+        };
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[server methodForSelector:setPromptSelector];
+        fn(server, setPromptSelector, [handler copy]);
+    }
+
+    SEL setErrorSelector = @selector(setErrorHandler:);
+    if ([server respondsToSelector:setErrorSelector]) {
+        id handler = ^(id error) {
+            printf("rpserver error: %s\n", error ? [[error description] UTF8String] : "nil");
+        };
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[server methodForSelector:setErrorSelector];
+        fn(server, setErrorSelector, [handler copy]);
+    }
+
+    SEL setAcceptSelector = @selector(setAcceptHandler:);
+    if ([server respondsToSelector:setAcceptSelector]) {
+        id handler = ^(id session) {
+            printf("rpserver accept session: class=%s description=%s\n",
+                   session ? class_getName([session class]) : "nil",
+                   RedactedLength(session).UTF8String);
+        };
+        typedef void (*SetHandlerFn)(id, SEL, id);
+        SetHandlerFn fn = (SetHandlerFn)[server methodForSelector:setAcceptSelector];
+        fn(server, setAcceptSelector, [handler copy]);
+    }
+
+    SEL activateSelector = @selector(activate);
+    if (![server respondsToSelector:activateSelector]) {
+        puts("RPServer activate unavailable");
+        return;
+    }
+    typedef void (*VoidFn)(id, SEL);
+    VoidFn activate = (VoidFn)[server methodForSelector:activateSelector];
+    activate(server, activateSelector);
+    puts("rpserver activated");
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+
+    SEL invalidateSelector = @selector(invalidate);
+    if ([server respondsToSelector:invalidateSelector]) {
+        VoidFn invalidate = (VoidFn)[server methodForSelector:invalidateSelector];
+        invalidate(server, invalidateSelector);
+    }
+}
+
 static void PrintPairingSummary(void) {
     LoadContinuityFrameworks();
 
@@ -1312,10 +2583,14 @@ static void Usage(const char *argv0) {
     fprintf(stderr, "usage:\n");
     fprintf(stderr, "  %s classes [FILTER]\n", argv0);
     fprintf(stderr, "  %s class CLASSNAME\n", argv0);
+    fprintf(stderr, "  %s class-imps CLASSNAME [FILTER]\n", argv0);
     fprintf(stderr, "  %s methods FILTER\n", argv0);
     fprintf(stderr, "  %s protocol PROTOCOLNAME\n", argv0);
     fprintf(stderr, "  %s pairing-summary\n", argv0);
     fprintf(stderr, "  %s keychain-summary\n", argv0);
+    fprintf(stderr, "  %s sec-spake [CLIENT_ID] [SERVER_ID] [SCHEME]\n", argv0);
+    fprintf(stderr, "  %s sec-spake-client CONTEXT CLIENT_ID SERVER_ID PASSWORD\n", argv0);
+    fprintf(stderr, "  %s sec-spake-server CONTEXT CLIENT_ID SERVER_ID SERVER_VERIFIER_HEX REGISTRATION_RECORD_HEX\n", argv0);
     fprintf(stderr, "  %s coreutils-symbols\n", argv0);
     fprintf(stderr, "  %s auth-types [MAX_TYPE]\n", argv0);
     fprintf(stderr, "  %s save-peer PEER_JSON [OPTIONS]\n", argv0);
@@ -1323,14 +2598,32 @@ static void Usage(const char *argv0) {
     fprintf(stderr, "  %s rpidentity-peer PEER_JSON [MAX_TYPE]\n", argv0);
     fprintf(stderr, "  %s rpclient-list-identities [FLAGS]\n", argv0);
     fprintf(stderr, "  %s rpclient-add-identity PEER_JSON [TYPE] [SOURCE]\n", argv0);
+    fprintf(stderr, "  %s rpclient-add-identity-nosource PEER_JSON [TYPE]\n", argv0);
+    fprintf(stderr, "  %s rpclient-diagnostic-command COMMAND [JSON|@PATH|-]\n", argv0);
+    fprintf(stderr, "  %s rpclient-endpoint-map APPLICATION_SERVICE DEVICE_ID ENDPOINT_ID\n", argv0);
+    fprintf(stderr, "  %s rpclient-internal-map TYPE APPLICATION_SERVICE DEVICE_ID ENDPOINT_ID\n", argv0);
+    fprintf(stderr, "  %s rpclient-listener-map LISTENER_ID DEVICE_ID\n", argv0);
+    fprintf(stderr, "  %s rpclient-query-listener-map LISTENER_ID DEVICE_ID\n", argv0);
+    fprintf(stderr, "  %s rpclient-auto-map on|off\n", argv0);
+    fprintf(stderr, "  %s rpcl-browse [SERVICE_TYPE] [SECONDS] [FLAGS] [CONTROL_FLAGS] [USE_CASE]\n", argv0);
     fprintf(stderr, "  %s rp-pairing-listen [SECONDS] [visible]\n", argv0);
     fprintf(stderr, "  %s rd-pairing-server [SECONDS]\n", argv0);
+    fprintf(stderr, "  %s rpserver-listen [SECONDS] [SERVICE_TYPE] [PASSWORD_TYPE] [PAIR_SETUP_FLAGS]\n", argv0);
+    fprintf(stderr, "  %s nw-appsvc-descriptor [SERVICE]\n", argv0);
+    fprintf(stderr, "  %s nw-appsvc-browse SERVICE [BUNDLE_ID] [SECONDS]\n", argv0);
+    fprintf(stderr, "  %s nw-appsvc-listen SERVICE [BUNDLE_ID] [SECONDS]\n", argv0);
+    fprintf(stderr, "  %s nw-appsvc-browse-custom SERVICE BUNDLE_ID CUSTOM_DATA [SECONDS]\n", argv0);
+    fprintf(stderr, "  %s nw-appsvc-listen-custom SERVICE BUNDLE_ID CUSTOM_DATA [SECONDS]\n", argv0);
+    fprintf(stderr, "    CUSTOM_DATA accepts @path, hex:001122, json:{...}, or a literal UTF-8 string\n");
+    fprintf(stderr, "  %s nw-appsvc-browse-pairing SERVICE BUNDLE_ID [SECONDS]\n", argv0);
+    fprintf(stderr, "  %s nw-appsvc-listen-pairing SERVICE BUNDLE_ID [PIN] [SECONDS]\n", argv0);
     fprintf(stderr, "\n");
     fprintf(stderr, "This tool is read-only and redacts keychain/private-key values by default.\n");
 }
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        setvbuf(stdout, NULL, _IOLBF, 0);
         if (argc < 2) {
             Usage(argv[0]);
             return 2;
@@ -1344,6 +2637,11 @@ int main(int argc, const char *argv[]) {
         }
         if ([command isEqualToString:@"class"] && argc == 3) {
             PrintClassInfo([NSString stringWithUTF8String:argv[2]]);
+            return 0;
+        }
+        if ([command isEqualToString:@"class-imps"] && argc >= 3) {
+            NSString *filter = argc >= 4 ? [NSString stringWithUTF8String:argv[3]] : @"";
+            PrintClassIMPs([NSString stringWithUTF8String:argv[2]], filter);
             return 0;
         }
         if ([command isEqualToString:@"methods"] && argc == 3) {
@@ -1360,6 +2658,36 @@ int main(int argc, const char *argv[]) {
         }
         if ([command isEqualToString:@"keychain-summary"]) {
             PrintKeychainSummary();
+            return 0;
+        }
+        if ([command isEqualToString:@"sec-spake"]) {
+            NSString *clientIdentity = argc >= 3 ? [NSString stringWithUTF8String:argv[2]] : @"fistel";
+            NSString *serverIdentity = argc >= 4 ? [NSString stringWithUTF8String:argv[3]] : @"endor";
+            unsigned short scheme = argc >= 5 ? (unsigned short)strtoul(argv[4], NULL, 0) : 1;
+            ProbeSecuritySPAKE(clientIdentity, serverIdentity, scheme);
+            return 0;
+        }
+        if ([command isEqualToString:@"sec-spake-client"] && argc == 6) {
+            CreateClientSPAKEIdentity([NSString stringWithUTF8String:argv[2]],
+                                      [NSString stringWithUTF8String:argv[3]],
+                                      [NSString stringWithUTF8String:argv[4]],
+                                      [NSString stringWithUTF8String:argv[5]]);
+            return 0;
+        }
+        if ([command isEqualToString:@"sec-spake-server"] && argc == 7) {
+            NSString *serverPasswordVerifier = [NSString stringWithUTF8String:argv[5]];
+            NSString *registrationRecord = [NSString stringWithUTF8String:argv[6]];
+            if (![serverPasswordVerifier hasPrefix:@"hex:"]) {
+                serverPasswordVerifier = [@"hex:" stringByAppendingString:serverPasswordVerifier];
+            }
+            if (![registrationRecord hasPrefix:@"hex:"]) {
+                registrationRecord = [@"hex:" stringByAppendingString:registrationRecord];
+            }
+            CreateServerSPAKEIdentity([NSString stringWithUTF8String:argv[2]],
+                                      [NSString stringWithUTF8String:argv[3]],
+                                      [NSString stringWithUTF8String:argv[4]],
+                                      serverPasswordVerifier,
+                                      registrationRecord);
             return 0;
         }
         if ([command isEqualToString:@"coreutils-symbols"]) {
@@ -1395,7 +2723,61 @@ int main(int argc, const char *argv[]) {
         if ([command isEqualToString:@"rpclient-add-identity"] && argc >= 3) {
             int type = argc >= 4 ? (int)strtol(argv[3], NULL, 0) : 13;
             int source = argc >= 5 ? (int)strtol(argv[4], NULL, 0) : 0;
-            TryRPClientAddIdentity([NSString stringWithUTF8String:argv[2]], type, source);
+            TryRPClientAddIdentity([NSString stringWithUTF8String:argv[2]], type, source, YES);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpclient-add-identity-nosource"] && argc >= 3) {
+            int type = argc >= 4 ? (int)strtol(argv[3], NULL, 0) : 13;
+            TryRPClientAddIdentity([NSString stringWithUTF8String:argv[2]], type, 0, NO);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpclient-diagnostic-command"] && argc >= 3) {
+            id params = argc >= 4 ? JSONValueFromArgument([NSString stringWithUTF8String:argv[3]]) : @{};
+            if (!params) {
+                return 1;
+            }
+            TryRPClientDiagnosticCommand([NSString stringWithUTF8String:argv[2]], params);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpclient-endpoint-map"] && argc >= 5) {
+            TryRPClientEndpointMapping([NSString stringWithUTF8String:argv[2]],
+                                       [NSString stringWithUTF8String:argv[3]],
+                                       [NSString stringWithUTF8String:argv[4]]);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpclient-internal-map"] && argc >= 6) {
+            int mappingType = (int)strtol(argv[2], NULL, 0);
+            TryRPClientInternalDeviceMapping(mappingType,
+                                             [NSString stringWithUTF8String:argv[3]],
+                                             [NSString stringWithUTF8String:argv[4]],
+                                             [NSString stringWithUTF8String:argv[5]]);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpclient-listener-map"] && argc >= 4) {
+            TryRPClientDeviceToListenerMapping([NSString stringWithUTF8String:argv[2]],
+                                               [NSString stringWithUTF8String:argv[3]]);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpclient-query-listener-map"] && argc >= 4) {
+            TryRPClientQueryDeviceToListenerMapping([NSString stringWithUTF8String:argv[2]],
+                                                    [NSString stringWithUTF8String:argv[3]]);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpclient-auto-map"] && argc >= 3) {
+            BOOL enabled = strcmp(argv[2], "on") == 0 || strcmp(argv[2], "1") == 0 || strcmp(argv[2], "true") == 0;
+            TryRPClientSetAutoMapping(enabled);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpcl-browse"]) {
+            NSString *serviceType = argc >= 3 ? [NSString stringWithUTF8String:argv[2]] : @"com.apple.universalcontrol";
+            NSTimeInterval seconds = argc >= 4 ? strtod(argv[3], NULL) : 8.0;
+            uint32_t flags = argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 0) : 0;
+            uint64_t controlFlags = argc >= 6 ? strtoull(argv[5], NULL, 0) : 0;
+            uint32_t useCase = argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 0) : 0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            TryRPCompanionLinkBrowse(serviceType, seconds, flags, controlFlags, useCase);
             return 0;
         }
         if ([command isEqualToString:@"rp-pairing-listen"]) {
@@ -1413,6 +2795,91 @@ int main(int argc, const char *argv[]) {
                 seconds = 0.1;
             }
             ProbeRemoteDisplayPairingServer(seconds);
+            return 0;
+        }
+        if ([command isEqualToString:@"rpserver-listen"]) {
+            NSTimeInterval seconds = argc >= 3 ? strtod(argv[2], NULL) : 10.0;
+            NSString *serviceType = argc >= 4 ? [NSString stringWithUTF8String:argv[3]] : @"";
+            int passwordType = argc >= 5 ? (int)strtol(argv[4], NULL, 0) : 10;
+            uint32_t pairSetupFlags = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 0) : 0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            ProbeRPServerListen(seconds, serviceType, passwordType, pairSetupFlags);
+            return 0;
+        }
+        if ([command isEqualToString:@"nw-appsvc-descriptor"]) {
+            NSString *serviceName = argc >= 3 ? [NSString stringWithUTF8String:argv[2]] : @"com.apple.macolinux.probe";
+            DumpNetworkApplicationServiceDescriptors(serviceName);
+            return 0;
+        }
+        if ([command isEqualToString:@"nw-appsvc-browse"] && argc >= 3) {
+            NSString *serviceName = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = argc >= 4 ? [NSString stringWithUTF8String:argv[3]] : @"";
+            NSTimeInterval seconds = argc >= 5 ? strtod(argv[4], NULL) : 8.0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            RunNetworkApplicationServiceBrowse(serviceName, bundleID, seconds, nil);
+            return 0;
+        }
+        if ([command isEqualToString:@"nw-appsvc-listen"] && argc >= 3) {
+            NSString *serviceName = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = argc >= 4 ? [NSString stringWithUTF8String:argv[3]] : @"";
+            NSTimeInterval seconds = argc >= 5 ? strtod(argv[4], NULL) : 8.0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            RunNetworkApplicationServiceListen(serviceName, bundleID, seconds, nil);
+            return 0;
+        }
+        if ([command isEqualToString:@"nw-appsvc-browse-custom"] && argc >= 5) {
+            NSString *serviceName = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = [NSString stringWithUTF8String:argv[3]];
+            NSData *customService = DataFromProbeArgument([NSString stringWithUTF8String:argv[4]]);
+            if (!customService) {
+                return 1;
+            }
+            NSTimeInterval seconds = argc >= 6 ? strtod(argv[5], NULL) : 8.0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            RunNetworkApplicationServiceBrowse(serviceName, bundleID, seconds, customService);
+            return 0;
+        }
+        if ([command isEqualToString:@"nw-appsvc-listen-custom"] && argc >= 5) {
+            NSString *serviceName = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = [NSString stringWithUTF8String:argv[3]];
+            NSData *customService = DataFromProbeArgument([NSString stringWithUTF8String:argv[4]]);
+            if (!customService) {
+                return 1;
+            }
+            NSTimeInterval seconds = argc >= 6 ? strtod(argv[5], NULL) : 8.0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            RunNetworkApplicationServiceListen(serviceName, bundleID, seconds, customService);
+            return 0;
+        }
+        if ([command isEqualToString:@"nw-appsvc-browse-pairing"] && argc >= 4) {
+            NSString *serviceName = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = [NSString stringWithUTF8String:argv[3]];
+            NSTimeInterval seconds = argc >= 5 ? strtod(argv[4], NULL) : 8.0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            RunNetworkApplicationServiceBrowse(serviceName, bundleID, seconds, BrowserPinPairingCustomService());
+            return 0;
+        }
+        if ([command isEqualToString:@"nw-appsvc-listen-pairing"] && argc >= 4) {
+            NSString *serviceName = [NSString stringWithUTF8String:argv[2]];
+            NSString *bundleID = [NSString stringWithUTF8String:argv[3]];
+            NSString *pin = argc >= 5 ? [NSString stringWithUTF8String:argv[4]] : @"123456";
+            NSTimeInterval seconds = argc >= 6 ? strtod(argv[5], NULL) : 8.0;
+            if (seconds < 0.1) {
+                seconds = 0.1;
+            }
+            RunNetworkApplicationServiceListen(serviceName, bundleID, seconds, ListenerPinPairingCustomService(pin));
             return 0;
         }
 

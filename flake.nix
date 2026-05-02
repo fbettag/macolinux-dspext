@@ -28,6 +28,11 @@
         }:
         let
           macolinux-ucd = pkgs.callPackage ./nix/package.nix { src = self; };
+          macolinuxBootstrapProgram =
+            if pkgs.stdenv.isDarwin then
+              "${macolinux-ucd}/Applications/MacolinuxBootstrap.app/Contents/MacOS/macolinux-uc-bootstrap"
+            else
+              "${macolinux-ucd}/bin/macolinux-uc-bootstrap";
         in
         {
           formatter = pkgs.nixfmt;
@@ -43,7 +48,19 @@
               program = "${macolinux-ucd}/bin/macolinux-ucd";
               meta.description = "Run the macolinux Universal Control daemon skeleton";
             };
+            macolinux-uc-bootstrap = {
+              type = "app";
+              program = macolinuxBootstrapProgram;
+              meta.description = "Run the experimental macOS trust-bootstrap helper";
+            };
             default = self.apps.${system}.macolinux-ucd;
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+            macolinux-macos-input-forwarder = {
+              type = "app";
+              program = "${macolinux-ucd}/bin/macolinux-macos-input-forwarder";
+              meta.description = "Forward macOS keyboard and pointer events to a macolinux input receiver";
+            };
           };
 
           devShells.default = pkgs.mkShell {

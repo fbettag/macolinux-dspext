@@ -11,8 +11,10 @@ use macolinux_uc_core::tlv8::{decode_tlv8, encode_tlv8};
 
 mod ble;
 mod identity;
+mod input;
 mod mdns;
 mod pairing;
+mod relay;
 mod serve;
 mod stream_server;
 
@@ -35,7 +37,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         Some("rapport") => run_rapport(&args[2..]),
         Some("eopack") => run_eopack(&args[2..]),
         Some("identity") => identity::run(&args[2..]),
+        Some("input") => input::run(&args[2..]),
         Some("pairing") => pairing::run(&args[2..]),
+        Some("relay") => relay::run(&args[2..]),
         Some("serve") => serve::run(&args[2..]),
         Some("stream") => stream_server::run(&args[2..]),
         Some("-h") | Some("--help") | None => {
@@ -229,7 +233,9 @@ Usage:
   macolinux-ucd identity create [--path PATH] [--identifier TEXT] [--force]
   macolinux-ucd identity show [--path PATH] [--show-secret]
   macolinux-ucd identity export-peer [--path PATH]
+  macolinux-ucd input listen [--bind ADDR:PORT] [--device /dev/uinput] [--dry-run]
   macolinux-ucd pairing resolve --addr HOST:PORT [--frame 0x07] [--shape companion-empty-request]
+  macolinux-ucd relay listen [--bind ADDR:PORT] [--send-text TEXT] [--echo]
   macolinux-ucd stream prepare --request-opack-hex HEX [--bind ADDR:PORT]
                               [--advertise-addr ADDR] [--accept-timeout-ms MS]
   macolinux-ucd serve [--instance NAME] [--hostname NAME.local] [--port PORT]
