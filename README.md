@@ -213,6 +213,28 @@ nix run .#macolinux-macos-input-forwarder -- \
   --self-test
 ```
 
+For the `fistel` NixOS host, the repo also includes a helper that performs the
+current working-session sequence without staging or committing `/etc/nixos`:
+
+```sh
+scripts/fistel-session.sh
+```
+
+It first checks `root@fistel`, then runs:
+
+```sh
+cd /etc/nixos
+nix run github:serokell/deploy-rs -- --targets .#fistel
+```
+
+After deployment it verifies `macolinux-uc-input`, checks `/dev/uinput`, and
+runs the macOS forwarder self-test against port `4720`. To start the live bridge
+after a successful deploy/self-test:
+
+```sh
+scripts/fistel-session.sh --no-deploy --live
+```
+
 ## NixOS Module
 
 The flake exposes `nixosModules.default`. A later `/etc/nixos` integration for
